@@ -3,7 +3,7 @@ import pandas as pd
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
-from tensorflow.keras.applications import EfficientNetB0
+from tensorflow.keras.applications import EfficientNetB3
 import os
 from sklearn.model_selection import train_test_split
 
@@ -17,8 +17,8 @@ TRAIN_CSV_PATH = os.path.join(BASE_PATH, 'train.csv')
 TEST_CSV_PATH = os.path.join(BASE_PATH, 'test.csv')
 
 # Constantes del modelo
-IMG_SIZE = 224 # Tamaño para EfficientNetB0
-BATCH_SIZE = 32
+IMG_SIZE = 300 # Tamaño para EfficientNetB3
+BATCH_SIZE = 16 # Reducido para B3 y imágenes más grandes
 LEARNING_RATE = 0.001
 EPOCHS = 10 # Empezar con pocas para probar
 TARGET_NAMES = ['Dry_Green_g', 'Dry_Dead_g', 'Dry_Clover_g', 'GDM_g', 'Dry_Total_g']
@@ -172,17 +172,18 @@ def weighted_mse_loss(y_true, y_pred):
 # --- 4. ARQUITECTURA DEL MODELO MULTIMODAL ---
 
 def build_model():
-    """Construye el modelo de solo visión (CNN)."""
+    """Construye el modelo de solo visión (CNN) usando EfficientNetB3."""
 
     # --- Entrada de Imagen (CNN) ---
     image_input = layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3), name='image_input')
 
-    base_model = EfficientNetB0(
+    base_model = EfficientNetB3(
         include_top=False,
         weights=None,
         input_tensor=image_input
     )
-    base_model.load_weights('/kaggle/input/tf-efficientnet-noisy-student-weights/efficientnet-b0_noisy-student_notop.h5', by_name=True)
+    # ATENCIÓN: Asegúrate de añadir el dataset "EfficientNet Keras Weights B0-B5" a tu notebook.
+    base_model.load_weights('../input/efficientnet-keras-weights-b0b5/efficientnet-b3_imagenet_1000_notop.h5', by_name=True)
     base_model.trainable = False # Empezar congelando el 'backbone'
 
     # Cabezal del Modelo
@@ -213,51 +214,37 @@ model.compile(
 model.summary()
 
 
-# --- 5. ENTRENAMIENTO Y FINE-TUNING ---
+# --- 5. ENTRENAMIENTO CON FINE-TUNING Y LR SCHEDULER ---
 
-# Hiperparámetros para el entrenamiento
-INITIAL_EPOCHS = 20
-FINE_TUNE_EPOCHS = 80
-TOTAL_EPOCHS = INITIAL_EPOCHS + FINE_TUNE_EPOCHS
-FINE_TUNE_LR = 1e-5
-
-# --- Fase 1: Entrenar solo el cabezal (con el modelo base congelado) ---
-print("--- Iniciando Fase 1: Entrenamiento del Cabezal ---")
-early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=8, restore_best_weights=True)
-
-history = model.fit(
-    train_ds,
-    epochs=INITIAL_EPOCHS,
-    validation_data=val_ds,
-    callbacks=[early_stopping]
-)
-
-# --- Fase 2: Descongelar y hacer Fine-Tuning Parcial ---
-print("\n--- Iniciando Fase 2: Fine-Tuning Parcial ---")
-# Descongelar las capas superiores del modelo base
+# Descongelamos las capas superiores del modelo para permitir el fine-tuning
 base_model.trainable = True
-
-# Congelamos todas las capas excepto las últimas 20
-for layer in base_model.layers[:-20]:
+for layer in base_model.layers[:-40]: # Congelamos más capas para B3, que es más grande
     layer.trainable = False
 
-# Volver a compilar el modelo con una tasa de aprendizaje muy baja
+# Re-compilamos el modelo para que los cambios de 'trainable' tengan efecto
+# Usamos la tasa de aprendizaje inicial aquí. El scheduler la reducirá.
 model.compile(
-    optimizer=keras.optimizers.Adam(learning_rate=FINE_TUNE_LR),
+    optimizer=keras.optimizers.Adam(learning_rate=LEARNING_RATE),
     loss=weighted_mse_loss,
     metrics=[WeightedR2Score()]
 )
 
-# Continuar el entrenamiento
-history_fine = model.fit(
+# Callbacks
+early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.1, patience=5, verbose=1)
+
+# Aumentamos las épocas para dar tiempo al scheduler a trabajar
+EPOCHS = 100
+
+print("--- Iniciando Entrenamiento con Fine-Tuning ---")
+history = model.fit(
     train_ds,
-    epochs=TOTAL_EPOCHS,
-    initial_epoch=history.epoch[-1], # Continuar desde donde lo dejamos
+    epochs=EPOCHS,
     validation_data=val_ds,
-    callbacks=[early_stopping] # Reutilizamos el mismo callback
+    callbacks=[early_stopping, reduce_lr]
 )
 
-print("Entrenamiento y Fine-Tuning completados.")
+print("Entrenamiento completado.")
 
 
 # --- 6. PREDICCIÓN Y SUMISIÓN ---

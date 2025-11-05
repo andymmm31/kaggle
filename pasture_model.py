@@ -199,9 +199,9 @@ def build_model():
         outputs=output
     )
 
-    return model
+    return model, base_model
 
-model = build_model()
+model, base_model = build_model()
 
 # Compilar el modelo con la pérdida personalizada y la nueva métrica
 model.compile(

@@ -34,12 +34,12 @@ LOSS_WEIGHTS = tf.constant([0.1, 0.1, 0.1, 0.2, 0.5])
 def load_and_pivot_data():
     """Carga train.csv y lo pivota a formato ancho."""
     df_train_long = pd.read_csv(TRAIN_CSV_PATH)
-    
+
     # --- Ingeniería de Características ---
     # 1. Procesar 'Sampling_Date'
     df_train_long['Sampling_Date'] = pd.to_datetime(df_train_long['Sampling_Date'])
     df_train_long['day_of_year'] = df_train_long['Sampling_Date'].dt.dayofyear
-    
+
     # 2. One-Hot Encoding para 'State' y 'Species'
     df_train_long = pd.get_dummies(df_train_long, columns=['State', 'Species'], prefix=['State', 'Species'])
 
@@ -51,21 +51,21 @@ def load_and_pivot_data():
 
     # Agrupamos por imagen y tomamos el primer valor (ya que son constantes por imagen)
     df_tabular_features = df_train_long.groupby('image_path')[feature_cols].first().reset_index()
-    
+
     # Pivoteamos los targets para tener una fila por imagen
     df_train_wide = df_train_long.pivot(
         index='image_path',
         columns='target_name',
         values='target'
     ).reset_index()
-    
+
     # Asegurarnos que el orden de columnas sea el correcto
     df_train_wide = df_train_wide.merge(df_tabular_features, on='image_path')
     df_train_wide = df_train_wide.dropna() # Quitar filas con targets faltantes
-    
+
     print(f"Datos 'anchos' para entrenamiento: {df_train_wide.shape}")
     print(df_train_wide.head())
-    
+
     return df_train_wide
 
 # Cargar los datos
@@ -98,33 +98,43 @@ def preprocess_image(image_path):
 
 def create_dataset(df):
     """Crea un tf.data.Dataset desde el dataframe ancho."""
-    
+
     tabular_features = df[TABULAR_FEATURES].values
-    
+
     image_paths = df['image_path'].values
     targets = df[TARGET_NAMES].values
-    
+
     # Dataset de rutas de imágenes
     ds_img = tf.data.Dataset.from_tensor_slices(image_paths)
     ds_img = ds_img.map(preprocess_image, num_parallel_calls=tf.data.AUTOTUNE)
-    
+
     # Dataset de features tabulares
     ds_tab = tf.data.Dataset.from_tensor_slices(tabular_features)
-    
+
     # Dataset de targets
     ds_tgt = tf.data.Dataset.from_tensor_slices(targets)
-    
-    # Combinar en un dataset de ( (img, tab), tgt )
-    ds = tf.data.Dataset.zip(( (ds_img, ds_tab), ds_tgt ))
-    
+
+    # Combinar inputs en un diccionario
+    ds_inputs = tf.data.Dataset.zip({
+        'image_input': ds_img,
+        'tabular_input': ds_tab
+    })
+
+    # Combinar en un dataset de ( {inputs}, tgt )
+    ds = tf.data.Dataset.zip((ds_inputs, ds_tgt))
+
     # --- Aumento de Datos ---
     data_augmentation = tf.keras.Sequential([
         layers.RandomFlip("horizontal_and_vertical"),
         layers.RandomRotation(0.2),
     ])
 
-    ds = ds.map(lambda x, y: ( (data_augmentation(x[0]), x[1]), y), num_parallel_calls=tf.data.AUTOTUNE)
-    
+    # El mapeo ahora recibe (dict_de_inputs, targets)
+    ds = ds.map(lambda x, y: ({
+        'image_input': data_augmentation(x['image_input']),
+        'tabular_input': x['tabular_input']
+    }, y), num_parallel_calls=tf.data.AUTOTUNE)
+
     ds = ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
     return ds
 
@@ -133,19 +143,66 @@ train_ds = create_dataset(train_df)
 val_ds = create_dataset(val_df)
 
 
-# --- 3. FUNCIÓN DE PÉRDIDA PERSONALIZADA ---
+# --- 3. MÉTRICA Y FUNCIÓN DE PÉRDIDA PERSONALIZADAS ---
+
+class WeightedR2Score(tf.keras.metrics.Metric):
+    """
+    Calcula el R² score global ponderado.
+    La fórmula es: 1 - (sum(w*(y_true-y_pred)^2) / sum(w*(y_true-y_mean)^2))
+    donde y_mean es la media global de y_true para cada target.
+    """
+    def __init__(self, name='weighted_r2_score', **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.weights = tf.constant([0.1, 0.1, 0.1, 0.2, 0.5], dtype=tf.float32)
+
+        # Variables de estado para calcular SS_res
+        self.sum_ss_res = self.add_weight(name='sum_ss_res', initializer='zeros')
+
+        # Variables de estado para calcular SS_tot (usando la fórmula expandida)
+        self.sum_y_true = self.add_weight(name='sum_y_true', shape=(N_TARGETS,), initializer='zeros')
+        self.sum_y_true_sq = self.add_weight(name='sum_y_true_sq', shape=(N_TARGETS,), initializer='zeros')
+        self.count = self.add_weight(name='count', initializer='zeros')
+
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.cast(y_pred, tf.float32)
+
+        # Actualizar sumas para SS_res
+        ss_res = tf.reduce_sum(self.weights * tf.square(y_true - y_pred))
+        self.sum_ss_res.assign_add(ss_res)
+
+        # Actualizar sumas para SS_tot
+        self.sum_y_true.assign_add(tf.reduce_sum(y_true, axis=0))
+        self.sum_y_true_sq.assign_add(tf.reduce_sum(tf.square(y_true), axis=0))
+        self.count.assign_add(tf.cast(tf.shape(y_true)[0], tf.float32))
+
+    def result(self):
+        # Calcular SS_tot a partir de las sumas acumuladas
+        # SS_tot = sum(w * (sum(y^2) - (sum(y))^2 / N))
+        ss_tot_per_target = self.sum_y_true_sq - (tf.square(self.sum_y_true) / self.count)
+        total_ss_tot = tf.reduce_sum(self.weights * ss_tot_per_target)
+
+        # Evitar división por cero
+        return 1.0 - (self.sum_ss_res / (total_ss_tot + tf.keras.backend.epsilon()))
+
+    def reset_state(self):
+        self.sum_ss_res.assign(0.0)
+        self.sum_y_true.assign(tf.zeros(shape=(N_TARGETS,)))
+        self.sum_y_true_sq.assign(tf.zeros(shape=(N_TARGETS,)))
+        self.count.assign(0.0)
+
 
 def weighted_mse_loss(y_true, y_pred):
     """Calcula el Mean Squared Error ponderado."""
     # y_true y y_pred tendrán forma (batch_size, 5)
-    
+
     # Calcular el error cuadrado por cada target
     error_sq = tf.square(y_true - y_pred)
-    
+
     # Multiplicar por los pesos
     # (batch_size, 5) * (5,) -> (batch_size, 5)
     weighted_error_sq = error_sq * LOSS_WEIGHTS
-    
+
     # Devolver la media de todos los errores ponderados en el batch
     return tf.reduce_mean(weighted_error_sq)
 
@@ -154,71 +211,72 @@ def weighted_mse_loss(y_true, y_pred):
 
 def build_model(n_tabular_features):
     """Construye el modelo multimodal (CNN + MLP)."""
-    
+
     # --- Rama 1: Entrada de Imagen (CNN) ---
     image_input = layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3), name='image_input')
-    
+
     # ¡¡¡IMPORTANTE!!!
     # 'weights="imagenet"' REQUIERE INTERNET. Fallará en la sumisión.
-    # [POR HACER]: 
+    # [POR HACER]:
     # 1. En Kaggle, haz clic en "Add Input" -> "Kaggle Datasets".
     # 2. Busca y añade un dataset de pesos de EfficientNetB0 (ej. "efficientnet-b0-keras-tl-weights").
     # 3. Cambia 'weights="imagenet"' por 'weights=None'.
     # 4. Después de 'base_model = ...', carga los pesos manualmente:
     #    base_model.load_weights('../input/dataset-de-pesos/efficientnetb0_notop.h5')
-    
+
     base_model = EfficientNetB0(
-        include_top=False, 
+        include_top=False,
         weights=None,
         input_tensor=image_input
     )
     base_model.load_weights('/kaggle/input/tf-efficientnet-noisy-student-weights/efficientnet-b0_noisy-student_notop.h5', by_name=True)
     base_model.trainable = False # Empezar congelando el 'backbone'
-    
+
     # Cabezal de la CNN
     x_img = layers.GlobalAveragePooling2D()(base_model.output)
     x_img = layers.Dense(128, activation='relu')(x_img)
     x_img = layers.Dropout(0.3)(x_img)
 
-    
+
     # --- Rama 2: Entrada Tabular (MLP) ---
     tabular_input = layers.Input(shape=(n_tabular_features,), name='tabular_input')
-    
+
     # Capa de Normalización
     normalizer = layers.Normalization(name='normalizer')
     normalizer.adapt(train_df[TABULAR_FEATURES].values)
-    
+
     x_tab = normalizer(tabular_input)
     x_tab = layers.Dense(32, activation='relu')(x_tab)
     x_tab = layers.Dense(16, activation='relu')(x_tab)
 
-    
+
     # --- Fusión ---
     concatenated = layers.Concatenate()([x_img, x_tab])
-    
+
     # --- Cabezal de Regresión (Head) ---
     x = layers.Dense(64, activation='relu')(concatenated)
     x = layers.Dropout(0.4)(x)
     output = layers.Dense(N_TARGETS, activation='linear', name='output')(x) # 'linear' para regresión
-    
+
     # [Opcional] Usar 'relu' si la biomasa nunca puede ser negativa
     # output = layers.Dense(N_TARGETS, activation='relu', name='output')(x)
 
-    
+
     # --- Crear el Modelo ---
     model = keras.Model(
         inputs=[image_input, tabular_input],
         outputs=output
     )
-    
+
     return model
 
 model = build_model(n_tabular_features=N_FEATURES)
 
-# Compilar el modelo con la pérdida personalizada
+# Compilar el modelo con la pérdida personalizada y la nueva métrica
 model.compile(
     optimizer=keras.optimizers.Adam(learning_rate=LEARNING_RATE),
-    loss=weighted_mse_loss
+    loss=weighted_mse_loss,
+    metrics=[WeightedR2Score()]
 )
 
 model.summary()
@@ -285,18 +343,23 @@ for col in TABULAR_FEATURES:
 
 def create_test_dataset(df):
     """Crea un dataset para inferencia (solo inputs)."""
-    
+
     tabular_features = df[TABULAR_FEATURES].values
-    
+
     image_paths = df['image_path'].values
-    
+
     # La función de preprocesamiento de entrenamiento funciona aquí también, ya que ahora toma rutas completas
     ds_img = tf.data.Dataset.from_tensor_slices(image_paths)
     ds_img = ds_img.map(preprocess_image, num_parallel_calls=tf.data.AUTOTUNE)
-    
+
     ds_tab = tf.data.Dataset.from_tensor_slices(tabular_features)
-    
-    ds = tf.data.Dataset.zip((ds_img, ds_tab))
+
+    # Combinar inputs en un diccionario para que coincida con el formato de entrenamiento
+    ds = tf.data.Dataset.zip({
+        'image_input': ds_img,
+        'tabular_input': ds_tab
+    })
+
     ds = ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
     return ds
 
@@ -329,7 +392,7 @@ df_submission = df_preds_long[['sample_id', 'target']]
 
 # [Opcional] Si el modelo predijo 'relu' (solo positivos), está bien.
 # Si usó 'linear', podríamos forzar que no haya biomasa negativa.
-df_submission['target'] = df_submission['target'].clip(lower=0) 
+df_submission['target'] = df_submission['target'].clip(lower=0)
 
 # ¡Guardar!
 df_submission.to_csv('submission.csv', index=False)

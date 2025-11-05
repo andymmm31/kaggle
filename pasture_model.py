@@ -5,7 +5,7 @@ from tensorflow import keras
 from tensorflow.keras import layers
 from tensorflow.keras.applications import EfficientNetB3
 import os
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import KFold
 
 # --- 1. CONFIGURACIÓN Y CONSTANTES ---
 
@@ -53,12 +53,8 @@ def load_and_pivot_data():
 # Cargar los datos
 df_train = load_and_pivot_data()
 
-# Dividir df_train en conjuntos de entrenamiento y validación
-train_df, val_df = train_test_split(df_train, test_size=0.1, random_state=42)
-
 # Crear rutas de imagen completas
-train_df['image_path'] = train_df['image_path'].apply(lambda x: os.path.join(BASE_PATH, x))
-val_df['image_path'] = val_df['image_path'].apply(lambda x: os.path.join(BASE_PATH, x))
+df_train['image_path'] = df_train['image_path'].apply(lambda x: os.path.join(BASE_PATH, x))
 
 
 def preprocess_image(image_path):
@@ -69,7 +65,7 @@ def preprocess_image(image_path):
     img = tf.keras.applications.efficientnet.preprocess_input(img) # Normalización de EfficientNet
     return img
 
-def create_dataset(df):
+def create_dataset(df, is_train=True):
     """Crea un tf.data.Dataset de (imagen, target) desde el dataframe."""
 
     image_paths = df['image_path'].values
@@ -85,24 +81,19 @@ def create_dataset(df):
     # Combinar en un dataset de (img, tgt)
     ds = tf.data.Dataset.zip((ds_img, ds_tgt))
 
-    # --- Aumento de Datos ---
-    data_augmentation = tf.keras.Sequential([
-        layers.RandomFlip("horizontal_and_vertical"),
-        layers.RandomRotation(0.2),
-        layers.RandomZoom(0.2),
-        layers.RandomBrightness(0.1), # Reducido de 0.2
-        layers.RandomContrast(0.1),  # Reducido de 0.2
-    ])
-
-    # Aplicar aumento solo a la imagen
-    ds = ds.map(lambda img, tgt: (data_augmentation(img), tgt), num_parallel_calls=tf.data.AUTOTUNE)
+    # Aplicar aumento de datos solo al set de entrenamiento
+    if is_train:
+        data_augmentation = tf.keras.Sequential([
+            layers.RandomFlip("horizontal_and_vertical"),
+            layers.RandomRotation(0.2),
+            layers.RandomZoom(0.2),
+            layers.RandomBrightness(0.1),
+            layers.RandomContrast(0.1),
+        ])
+        ds = ds.map(lambda img, tgt: (data_augmentation(img), tgt), num_parallel_calls=tf.data.AUTOTUNE)
 
     ds = ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
     return ds
-
-# Crear los datasets de entrenamiento y validación
-train_ds = create_dataset(train_df)
-val_ds = create_dataset(val_df)
 
 
 # --- 3. MÉTRICA Y FUNCIÓN DE PÉRDIDA PERSONALIZADAS ---
@@ -202,117 +193,120 @@ def build_model():
 
     return model, base_model
 
-model, base_model = build_model()
 
-# Compilar el modelo con la pérdida personalizada y la nueva métrica
-model.compile(
-    optimizer=keras.optimizers.Adam(learning_rate=LEARNING_RATE),
-    loss=weighted_mse_loss,
-    metrics=[WeightedR2Score()]
-)
+# --- 5. ENTRENAMIENTO CON CROSS-VALIDATION ---
+N_FOLDS = 5
+EPOCHS = 60 # Épocas por fold
+kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=42)
 
-model.summary()
+for fold, (train_idx, val_idx) in enumerate(kf.split(df_train)):
+    print(f"\n--- Iniciando Entrenamiento para Fold {fold+1}/{N_FOLDS} ---")
+
+    # Crear dataframes para este fold
+    train_df_fold = df_train.iloc[train_idx]
+    val_df_fold = df_train.iloc[val_idx]
+
+    # Crear datasets para este fold
+    train_ds = create_dataset(train_df_fold, is_train=True)
+    val_ds = create_dataset(val_df_fold, is_train=False) # No aumentar datos en validación
+
+    # Construir y compilar un modelo nuevo para cada fold
+    model, base_model = build_model()
+
+    # Descongelar para fine-tuning
+    base_model.trainable = True
+    for layer in base_model.layers[:-40]:
+        layer.trainable = False
+
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=LEARNING_RATE),
+        loss=weighted_mse_loss,
+        metrics=[WeightedR2Score()]
+    )
+
+    # Callbacks
+    early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+    reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.1, patience=5, verbose=1)
+
+    # Entrenar el modelo
+    model.fit(
+        train_ds,
+        epochs=EPOCHS,
+        validation_data=val_ds,
+        callbacks=[early_stopping, reduce_lr]
+    )
+
+    # Guardar los pesos del modelo entrenado
+    model.save_weights(f'model_fold_{fold}.h5')
+
+print("\n--- Entrenamiento con Cross-Validation completado. ---")
 
 
-# --- 5. ENTRENAMIENTO CON FINE-TUNING Y LR SCHEDULER ---
+# --- 6. PREDICCIÓN CON ENSEMBLE Y TTA ---
 
-# Descongelamos las capas superiores del modelo para permitir el fine-tuning
-base_model.trainable = True
-for layer in base_model.layers[:-40]: # Congelamos más capas para B3, que es más grande
-    layer.trainable = False
-
-# Re-compilamos el modelo para que los cambios de 'trainable' tengan efecto
-# Usamos la tasa de aprendizaje inicial aquí. El scheduler la reducirá.
-model.compile(
-    optimizer=keras.optimizers.Adam(learning_rate=LEARNING_RATE),
-    loss=weighted_mse_loss,
-    metrics=[WeightedR2Score()]
-)
-
-# Callbacks
-early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
-reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.1, patience=5, verbose=1)
-
-# Aumentamos las épocas para dar tiempo al scheduler a trabajar
-EPOCHS = 100
-
-print("--- Iniciando Entrenamiento con Fine-Tuning ---")
-history = model.fit(
-    train_ds,
-    epochs=EPOCHS,
-    validation_data=val_ds,
-    callbacks=[early_stopping, reduce_lr]
-)
-
-print("Entrenamiento completado.")
-
-
-# --- 6. PREDICCIÓN Y SUMISIÓN ---
-
-print("Generando predicciones de sumisión...")
+print("Generando predicciones de sumisión con Ensemble y TTA...")
 df_test_long = pd.read_csv(TEST_CSV_PATH)
-
-# El test.csv tiene múltiples filas por imagen, pero solo necesitamos predecir UNA VEZ por imagen
 df_test_unique_images = df_test_long[['image_path']].drop_duplicates()
-
-# Crear rutas de imagen completas para el conjunto de prueba
 df_test_unique_images['image_path'] = df_test_unique_images['image_path'].apply(lambda x: os.path.join(BASE_PATH, x))
 
+def create_test_dataset(df, augment=False):
+    """Crea un dataset de test, con opción de aumento para TTA."""
+    ds = tf.data.Dataset.from_tensor_slices(df['image_path'].values)
+    ds = ds.map(preprocess_image, num_parallel_calls=tf.data.AUTOTUNE)
 
-def create_test_dataset(df):
-    """Crea un dataset de solo imágenes para inferencia."""
+    if augment:
+        # Para TTA, solo usaremos un aumento simple como el volteo horizontal
+        ds = ds.map(lambda img: tf.image.random_flip_left_right(img), num_parallel_calls=tf.data.AUTOTUNE)
 
-    image_paths = df['image_path'].values
-
-    ds_img = tf.data.Dataset.from_tensor_slices(image_paths)
-    ds_img = ds_img.map(preprocess_image, num_parallel_calls=tf.data.AUTOTUNE)
-
-    ds = ds_img.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+    ds = ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
     return ds
 
-test_ds = create_test_dataset(df_test_unique_images)
+# Crear datasets de test (original y aumentado para TTA)
+test_ds_original = create_test_dataset(df_test_unique_images, augment=False)
+test_ds_augmented = create_test_dataset(df_test_unique_images, augment=True)
 
-# Predecir con el modelo
-# El resultado (preds) será un array (N_imagenes, 5)
-preds = model.predict(test_ds)
+# Construir un modelo solo para cargar los pesos
+inference_model, _ = build_model()
+all_preds = []
 
-# --- Lógica de Sumisión a Prueba de Errores ---
+for fold in range(N_FOLDS):
+    print(f"Prediciendo con modelo del Fold {fold+1}/{N_FOLDS}...")
+    inference_model.load_weights(f'model_fold_{fold}.h5')
 
-# 1. Crear un dataframe con las predicciones en formato ancho
-df_preds_wide = pd.DataFrame(preds, columns=TARGET_NAMES)
-# `df_test_unique_images.image_path` tiene la ruta completa, necesitamos la ruta relativa para el merge
+    # Predecir en imágenes originales
+    preds_original = inference_model.predict(test_ds_original)
+    # Predecir en imágenes aumentadas (TTA)
+    preds_augmented = inference_model.predict(test_ds_augmented)
+
+    # Promediar las predicciones de TTA y añadir a la lista
+    avg_preds = (preds_original + preds_augmented) / 2.0
+    all_preds.append(avg_preds)
+
+# Promediar las predicciones de todos los folds (Ensemble)
+final_preds = np.mean(all_preds, axis=0)
+
+# --- Generar archivo de sumisión (misma lógica que antes) ---
+df_preds_wide = pd.DataFrame(final_preds, columns=TARGET_NAMES)
 df_preds_wide['image_path'] = df_test_unique_images['image_path'].apply(lambda x: os.path.relpath(x, BASE_PATH)).values
 
-# 2. "Derretir" (melt) el dataframe para pasarlo a formato largo
 df_preds_long = df_preds_wide.melt(
     id_vars=['image_path'],
     value_vars=TARGET_NAMES,
     var_name='target_name',
-    value_name='predicted_target' # Renombrar para evitar colisión en el merge
+    value_name='predicted_target'
 )
 
-# 3. Usar el df_test_long original como base para la sumisión
-# Esto garantiza que todos los sample_id y el orden son correctos.
-# Necesitamos el df_test_long ANTES del pre-procesamiento, así que lo volvemos a cargar.
 df_submission_scaffold = pd.read_csv(TEST_CSV_PATH)
-
-# 4. Unir (merge) el scaffold con nuestras predicciones
 df_submission = pd.merge(
     df_submission_scaffold,
     df_preds_long,
     on=['image_path', 'target_name'],
-    how='left' # 'left' para mantener todas las filas del archivo de test original
+    how='left'
 )
 
-# 5. Seleccionar las columnas finales y renombrar
-df_submission = df_submission[['sample_id', 'predicted_target']]
-df_submission = df_submission.rename(columns={'predicted_target': 'target'})
-
-# [Opcional] Forzar que no haya biomasa negativa
+df_submission = df_submission[['sample_id', 'predicted_target']].rename(columns={'predicted_target': 'target'})
 df_submission['target'] = df_submission['target'].clip(lower=0)
-
-# 6. ¡Guardar!
 df_submission.to_csv('submission.csv', index=False)
 
-print("Archivo submission.csv creado exitosamente.")
+print("\nArchivo submission.csv creado exitosamente.")
 print(df_submission.head())

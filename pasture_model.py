@@ -82,6 +82,11 @@ val_df['image_path'] = val_df['image_path'].apply(lambda x: os.path.join(TRAIN_I
 TABULAR_FEATURES = [col for col in train_df.columns if col not in ['image_path'] + TARGET_NAMES]
 N_FEATURES = len(TABULAR_FEATURES)
 
+# Asegurarse de que todas las características tabulares sean float32
+for col in TABULAR_FEATURES:
+    train_df[col] = train_df[col].astype('float32')
+    val_df[col] = val_df[col].astype('float32')
+
 
 def preprocess_image(image_path):
     """Carga y pre-procesa una imagen desde una ruta completa."""
@@ -262,6 +267,10 @@ df_test_unique_images = df_test_features.drop_duplicates(subset=['image_path'])
 
 # Crear rutas de imagen completas para el conjunto de prueba
 df_test_unique_images['image_path'] = df_test_unique_images['image_path'].apply(lambda x: os.path.join(TEST_IMG_PATH, x))
+
+# Asegurarse de que todas las características tabulares sean float32 en el conjunto de prueba
+for col in TABULAR_FEATURES:
+    df_test_unique_images[col] = df_test_unique_images[col].astype('float32')
 
 def create_test_dataset(df):
     """Crea un dataset para inferencia (solo inputs)."""

@@ -10,7 +10,7 @@ from sklearn.model_selection import train_test_split
 # --- 1. CONFIGURACIÓN Y CONSTANTES ---
 
 # Rutas de Kaggle (basado en tu captura de pantalla)
-BASE_PATH = '../input/csiro-image2biomass-prediction'
+BASE_PATH = '/kaggle/input/csiro-image2biomass-prediction'
 TRAIN_IMG_PATH = os.path.join(BASE_PATH, 'train')
 TEST_IMG_PATH = os.path.join(BASE_PATH, 'test')
 TRAIN_CSV_PATH = os.path.join(BASE_PATH, 'train.csv')
@@ -163,7 +163,7 @@ def build_model(n_tabular_features):
         weights=None,
         input_tensor=image_input
     )
-    base_model.load_weights('../input/efficientnetb0-keras-weights/efficientnetb0_notop.h5')
+    base_model.load_weights('/kaggle/input/efficientnetb0-keras-weights/efficientnetb0_notop.h5')
     base_model.trainable = False # Empezar congelando el 'backbone'
     
     # Cabezal de la CNN

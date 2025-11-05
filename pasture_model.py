@@ -32,25 +32,8 @@ LOSS_WEIGHTS = tf.constant([0.1, 0.1, 0.1, 0.2, 0.5])
 # --- 2. PRE-PROCESAMIENTO DE DATOS ---
 
 def load_and_pivot_data():
-    """Carga train.csv y lo pivota a formato ancho."""
+    """Carga train.csv y lo pivota a formato ancho, solo con targets."""
     df_train_long = pd.read_csv(TRAIN_CSV_PATH)
-
-    # --- Ingeniería de Características ---
-    # 1. Procesar 'Sampling_Date'
-    df_train_long['Sampling_Date'] = pd.to_datetime(df_train_long['Sampling_Date'])
-    df_train_long['day_of_year'] = df_train_long['Sampling_Date'].dt.dayofyear
-
-    # 2. One-Hot Encoding para 'State' y 'Species'
-    df_train_long = pd.get_dummies(df_train_long, columns=['State', 'Species'], prefix=['State', 'Species'])
-
-    # 3. Consolidar características
-    # Primero, definimos las columnas de características que no cambian por imagen
-    # (NDVI, Altura, fecha, y las nuevas columnas one-hot)
-    feature_cols = ['Pre_GSHH_NDVI', 'Height_Ave_cm', 'day_of_year'] + \
-                   [col for col in df_train_long.columns if col.startswith('State_') or col.startswith('Species_')]
-
-    # Agrupamos por imagen y tomamos el primer valor (ya que son constantes por imagen)
-    df_tabular_features = df_train_long.groupby('image_path')[feature_cols].first().reset_index()
 
     # Pivoteamos los targets para tener una fila por imagen
     df_train_wide = df_train_long.pivot(
@@ -59,9 +42,8 @@ def load_and_pivot_data():
         values='target'
     ).reset_index()
 
-    # Asegurarnos que el orden de columnas sea el correcto
-    df_train_wide = df_train_wide.merge(df_tabular_features, on='image_path')
-    df_train_wide = df_train_wide.dropna() # Quitar filas con targets faltantes
+    # Quitar filas con targets faltantes
+    df_train_wide = df_train_wide.dropna()
 
     print(f"Datos 'anchos' para entrenamiento: {df_train_wide.shape}")
     print(df_train_wide.head())
@@ -78,15 +60,6 @@ train_df, val_df = train_test_split(df_train, test_size=0.1, random_state=42)
 train_df['image_path'] = train_df['image_path'].apply(lambda x: os.path.join(BASE_PATH, x))
 val_df['image_path'] = val_df['image_path'].apply(lambda x: os.path.join(BASE_PATH, x))
 
-# Obtener la lista de características tabulares después de la ingeniería de características
-TABULAR_FEATURES = [col for col in train_df.columns if col not in ['image_path'] + TARGET_NAMES]
-N_FEATURES = len(TABULAR_FEATURES)
-
-# Asegurarse de que todas las características tabulares sean float32
-for col in TABULAR_FEATURES:
-    train_df[col] = train_df[col].astype('float32')
-    val_df[col] = val_df[col].astype('float32')
-
 
 def preprocess_image(image_path):
     """Carga y pre-procesa una imagen desde una ruta completa."""
@@ -97,9 +70,7 @@ def preprocess_image(image_path):
     return img
 
 def create_dataset(df):
-    """Crea un tf.data.Dataset desde el dataframe ancho."""
-
-    tabular_features = df[TABULAR_FEATURES].values
+    """Crea un tf.data.Dataset de (imagen, target) desde el dataframe."""
 
     image_paths = df['image_path'].values
     targets = df[TARGET_NAMES].values
@@ -108,20 +79,11 @@ def create_dataset(df):
     ds_img = tf.data.Dataset.from_tensor_slices(image_paths)
     ds_img = ds_img.map(preprocess_image, num_parallel_calls=tf.data.AUTOTUNE)
 
-    # Dataset de features tabulares
-    ds_tab = tf.data.Dataset.from_tensor_slices(tabular_features)
-
     # Dataset de targets
     ds_tgt = tf.data.Dataset.from_tensor_slices(targets)
 
-    # Combinar inputs en un diccionario
-    ds_inputs = tf.data.Dataset.zip({
-        'image_input': ds_img,
-        'tabular_input': ds_tab
-    })
-
-    # Combinar en un dataset de ( {inputs}, tgt )
-    ds = tf.data.Dataset.zip((ds_inputs, ds_tgt))
+    # Combinar en un dataset de (img, tgt)
+    ds = tf.data.Dataset.zip((ds_img, ds_tgt))
 
     # --- Aumento de Datos ---
     data_augmentation = tf.keras.Sequential([
@@ -129,11 +91,8 @@ def create_dataset(df):
         layers.RandomRotation(0.2),
     ])
 
-    # El mapeo ahora recibe (dict_de_inputs, targets)
-    ds = ds.map(lambda x, y: ({
-        'image_input': data_augmentation(x['image_input']),
-        'tabular_input': x['tabular_input']
-    }, y), num_parallel_calls=tf.data.AUTOTUNE)
+    # Aplicar aumento solo a la imagen
+    ds = ds.map(lambda img, tgt: (data_augmentation(img), tgt), num_parallel_calls=tf.data.AUTOTUNE)
 
     ds = ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
     return ds
@@ -209,20 +168,11 @@ def weighted_mse_loss(y_true, y_pred):
 
 # --- 4. ARQUITECTURA DEL MODELO MULTIMODAL ---
 
-def build_model(n_tabular_features):
-    """Construye el modelo multimodal (CNN + MLP)."""
+def build_model():
+    """Construye el modelo de solo visión (CNN)."""
 
-    # --- Rama 1: Entrada de Imagen (CNN) ---
+    # --- Entrada de Imagen (CNN) ---
     image_input = layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3), name='image_input')
-
-    # ¡¡¡IMPORTANTE!!!
-    # 'weights="imagenet"' REQUIERE INTERNET. Fallará en la sumisión.
-    # [POR HACER]:
-    # 1. En Kaggle, haz clic en "Add Input" -> "Kaggle Datasets".
-    # 2. Busca y añade un dataset de pesos de EfficientNetB0 (ej. "efficientnet-b0-keras-tl-weights").
-    # 3. Cambia 'weights="imagenet"' por 'weights=None'.
-    # 4. Después de 'base_model = ...', carga los pesos manualmente:
-    #    base_model.load_weights('../input/dataset-de-pesos/efficientnetb0_notop.h5')
 
     base_model = EfficientNetB0(
         include_top=False,
@@ -232,45 +182,23 @@ def build_model(n_tabular_features):
     base_model.load_weights('/kaggle/input/tf-efficientnet-noisy-student-weights/efficientnet-b0_noisy-student_notop.h5', by_name=True)
     base_model.trainable = False # Empezar congelando el 'backbone'
 
-    # Cabezal de la CNN
-    x_img = layers.GlobalAveragePooling2D()(base_model.output)
-    x_img = layers.Dense(128, activation='relu')(x_img)
-    x_img = layers.Dropout(0.3)(x_img)
-
-
-    # --- Rama 2: Entrada Tabular (MLP) ---
-    tabular_input = layers.Input(shape=(n_tabular_features,), name='tabular_input')
-
-    # Capa de Normalización
-    normalizer = layers.Normalization(name='normalizer')
-    normalizer.adapt(train_df[TABULAR_FEATURES].values)
-
-    x_tab = normalizer(tabular_input)
-    x_tab = layers.Dense(32, activation='relu')(x_tab)
-    x_tab = layers.Dense(16, activation='relu')(x_tab)
-
-
-    # --- Fusión ---
-    concatenated = layers.Concatenate()([x_img, x_tab])
-
-    # --- Cabezal de Regresión (Head) ---
-    x = layers.Dense(64, activation='relu')(concatenated)
+    # Cabezal del Modelo
+    x = layers.GlobalAveragePooling2D()(base_model.output)
+    x = layers.Dense(128, activation='relu')(x)
+    x = layers.Dropout(0.3)(x)
+    x = layers.Dense(64, activation='relu')(x)
     x = layers.Dropout(0.4)(x)
-    output = layers.Dense(N_TARGETS, activation='linear', name='output')(x) # 'linear' para regresión
-
-    # [Opcional] Usar 'relu' si la biomasa nunca puede ser negativa
-    # output = layers.Dense(N_TARGETS, activation='relu', name='output')(x)
-
+    output = layers.Dense(N_TARGETS, activation='linear', name='output')(x)
 
     # --- Crear el Modelo ---
     model = keras.Model(
-        inputs=[image_input, tabular_input],
+        inputs=image_input,
         outputs=output
     )
 
     return model
 
-model = build_model(n_tabular_features=N_FEATURES)
+model = build_model()
 
 # Compilar el modelo con la pérdida personalizada y la nueva métrica
 model.compile(
@@ -301,66 +229,22 @@ print("Entrenamiento completado.")
 print("Generando predicciones de sumisión...")
 df_test_long = pd.read_csv(TEST_CSV_PATH)
 
-# --- Lógica de Relleno para el Entorno de Prueba ---
-# Comprueba si las columnas de características existen. Si no, las crea con valores de relleno.
-if 'Sampling_Date' not in df_test_long.columns:
-    print("El test.csv no tiene características. Creando valores de relleno para la ejecución...")
-    # Usamos la fecha actual como relleno
-    df_test_long['Sampling_Date'] = pd.to_datetime('today')
-    # Rellenamos las columnas categóricas originales antes del one-hot encoding
-    df_test_long['State'] = 'VIC' # Relleno con un valor común
-    df_test_long['Species'] = 'RYEGRASS' # Relleno con un valor común
-    # Rellenamos las características numéricas con la media del conjunto de entrenamiento
-    df_test_long['Pre_GSHH_NDVI'] = train_df['Pre_GSHH_NDVI'].mean()
-    df_test_long['Height_Ave_cm'] = train_df['Height_Ave_cm'].mean()
-
-# Aplicar la misma ingeniería de características al conjunto de prueba
-df_test_long['Sampling_Date'] = pd.to_datetime(df_test_long['Sampling_Date'])
-df_test_long['day_of_year'] = df_test_long['Sampling_Date'].dt.dayofyear
-df_test_long = pd.get_dummies(df_test_long, columns=['State', 'Species'], prefix=['State', 'Species'])
-
-# Alinear columnas con el conjunto de entrenamiento (importante para one-hot encoding)
-train_cols = set(train_df.columns)
-test_cols = set(df_test_long.columns)
-
-missing_in_test = list(train_cols - test_cols)
-for col in missing_in_test:
-    if col.startswith('State_') or col.startswith('Species_'):
-        df_test_long[col] = 0
-
-# Asegurarse de que el orden de las columnas sea el mismo
-df_test_features = df_test_long.groupby('image_path')[TABULAR_FEATURES].first().reset_index()
-
 # El test.csv tiene múltiples filas por imagen, pero solo necesitamos predecir UNA VEZ por imagen
-df_test_unique_images = df_test_features.drop_duplicates(subset=['image_path'])
+df_test_unique_images = df_test_long[['image_path']].drop_duplicates()
 
 # Crear rutas de imagen completas para el conjunto de prueba
 df_test_unique_images['image_path'] = df_test_unique_images['image_path'].apply(lambda x: os.path.join(BASE_PATH, x))
 
-# Asegurarse de que todas las características tabulares sean float32 en el conjunto de prueba
-for col in TABULAR_FEATURES:
-    df_test_unique_images[col] = df_test_unique_images[col].astype('float32')
 
 def create_test_dataset(df):
-    """Crea un dataset para inferencia (solo inputs)."""
-
-    tabular_features = df[TABULAR_FEATURES].values
+    """Crea un dataset de solo imágenes para inferencia."""
 
     image_paths = df['image_path'].values
 
-    # La función de preprocesamiento de entrenamiento funciona aquí también, ya que ahora toma rutas completas
     ds_img = tf.data.Dataset.from_tensor_slices(image_paths)
     ds_img = ds_img.map(preprocess_image, num_parallel_calls=tf.data.AUTOTUNE)
 
-    ds_tab = tf.data.Dataset.from_tensor_slices(tabular_features)
-
-    # Combinar inputs en un diccionario para que coincida con el formato de entrenamiento
-    ds = tf.data.Dataset.zip({
-        'image_input': ds_img,
-        'tabular_input': ds_tab
-    })
-
-    ds = ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+    ds = ds_img.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
     return ds
 
 test_ds = create_test_dataset(df_test_unique_images)
@@ -369,32 +253,42 @@ test_ds = create_test_dataset(df_test_unique_images)
 # El resultado (preds) será un array (N_imagenes, 5)
 preds = model.predict(test_ds)
 
-# Mapear predicciones de (N, 5) a formato largo
-# Crear un dataframe con las predicciones en formato ancho
-df_preds_wide = pd.DataFrame(preds, columns=TARGET_NAMES)
-df_preds_wide['image_path'] = df_test_unique_images['image_path'].values
+# --- Lógica de Sumisión a Prueba de Errores ---
 
-# "Derretir" (melt) el dataframe para pasarlo a formato largo
+# 1. Crear un dataframe con las predicciones en formato ancho
+df_preds_wide = pd.DataFrame(preds, columns=TARGET_NAMES)
+# `df_test_unique_images.image_path` tiene la ruta completa, necesitamos la ruta relativa para el merge
+df_preds_wide['image_path'] = df_test_unique_images['image_path'].apply(lambda x: os.path.relpath(x, BASE_PATH)).values
+
+# 2. "Derretir" (melt) el dataframe para pasarlo a formato largo
 df_preds_long = df_preds_wide.melt(
     id_vars=['image_path'],
     value_vars=TARGET_NAMES,
     var_name='target_name',
-    value_name='target'
+    value_name='predicted_target' # Renombrar para evitar colisión en el merge
 )
 
-# Crear el 'sample_id'
-df_preds_long['image_path_basename'] = df_preds_long['image_path'].apply(os.path.basename)
-df_preds_long['sample_id'] = df_preds_long['image_path_basename'] + '__' + df_preds_long['target_name']
+# 3. Usar el df_test_long original como base para la sumisión
+# Esto garantiza que todos los sample_id y el orden son correctos.
+# Necesitamos el df_test_long ANTES del pre-procesamiento, así que lo volvemos a cargar.
+df_submission_scaffold = pd.read_csv(TEST_CSV_PATH)
 
-# Generar el archivo de sumisión
-# Nos aseguramos de tener el mismo orden y columnas que sample_submission.csv
-df_submission = df_preds_long[['sample_id', 'target']]
+# 4. Unir (merge) el scaffold con nuestras predicciones
+df_submission = pd.merge(
+    df_submission_scaffold,
+    df_preds_long,
+    on=['image_path', 'target_name'],
+    how='left' # 'left' para mantener todas las filas del archivo de test original
+)
 
-# [Opcional] Si el modelo predijo 'relu' (solo positivos), está bien.
-# Si usó 'linear', podríamos forzar que no haya biomasa negativa.
+# 5. Seleccionar las columnas finales y renombrar
+df_submission = df_submission[['sample_id', 'predicted_target']]
+df_submission = df_submission.rename(columns={'predicted_target': 'target'})
+
+# [Opcional] Forzar que no haya biomasa negativa
 df_submission['target'] = df_submission['target'].clip(lower=0)
 
-# ¡Guardar!
+# 6. ¡Guardar!
 df_submission.to_csv('submission.csv', index=False)
 
 print("Archivo submission.csv creado exitosamente.")

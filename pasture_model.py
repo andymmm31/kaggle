@@ -237,7 +237,7 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(df_train)):
     )
 
     # Guardar los pesos del modelo entrenado
-    model.save_weights(f'model_fold_{fold}.h5')
+    model.save_weights(f'model_fold_{fold}.weights.h5')
 
 print("\n--- Entrenamiento con Cross-Validation completado. ---")
 
@@ -271,7 +271,7 @@ all_preds = []
 
 for fold in range(N_FOLDS):
     print(f"Prediciendo con modelo del Fold {fold+1}/{N_FOLDS}...")
-    inference_model.load_weights(f'model_fold_{fold}.h5')
+    inference_model.load_weights(f'model_fold_{fold}.weights.h5')
 
     # Predecir en imágenes originales
     preds_original = inference_model.predict(test_ds_original)

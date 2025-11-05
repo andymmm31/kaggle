@@ -5,6 +5,7 @@ from tensorflow import keras
 from tensorflow.keras import layers
 from tensorflow.keras.applications import EfficientNetB0
 import os
+from sklearn.model_selection import train_test_split
 
 # --- 1. CONFIGURACIÓN Y CONSTANTES ---
 
@@ -34,19 +35,27 @@ def load_and_pivot_data():
     """Carga train.csv y lo pivota a formato ancho."""
     df_train_long = pd.read_csv(TRAIN_CSV_PATH)
     
-    # [POR HACER] Procesar características tabulares
-    # Aquí debes manejar 'Sampling_Date', 'State', 'Species' si los vas a usar.
-    # Por ejemplo, extraer mes/año, hacer one-hot encoding a 'State', etc.
-    # Guardar las características únicas por 'image_path'.
+    # --- Ingeniería de Características ---
+    # 1. Procesar 'Sampling_Date'
+    df_train_long['Sampling_Date'] = pd.to_datetime(df_train_long['Sampling_Date'])
+    df_train_long['day_of_year'] = df_train_long['Sampling_Date'].dt.dayofyear
     
-    # Ejemplo de datos tabulares (solo los numéricos por ahora)
-    # Agrupamos por imagen y tomamos la media (o primer valor) de los features
-    df_tabular_features = df_train_long.groupby('image_path')[['Pre_GSHH_NDVI', 'Height_Ave_cm']].mean().reset_index()
+    # 2. One-Hot Encoding para 'State' y 'Species'
+    df_train_long = pd.get_dummies(df_train_long, columns=['State', 'Species'], prefix=['State', 'Species'])
+
+    # 3. Consolidar características
+    # Primero, definimos las columnas de características que no cambian por imagen
+    # (NDVI, Altura, fecha, y las nuevas columnas one-hot)
+    feature_cols = ['Pre_GSHH_NDVI', 'Height_Ave_cm', 'day_of_year'] + \
+                   [col for col in df_train_long.columns if col.startswith('State_') or col.startswith('Species_')]
+
+    # Agrupamos por imagen y tomamos el primer valor (ya que son constantes por imagen)
+    df_tabular_features = df_train_long.groupby('image_path')[feature_cols].first().reset_index()
     
     # Pivoteamos los targets para tener una fila por imagen
     df_train_wide = df_train_long.pivot(
-        index='image_path', 
-        columns='target_name', 
+        index='image_path',
+        columns='target_name',
         values='target'
     ).reset_index()
     
@@ -62,8 +71,12 @@ def load_and_pivot_data():
 # Cargar los datos
 df_train = load_and_pivot_data()
 
-# [POR HACER] Aquí deberías dividir df_train en train y validation
-# train_df, val_df = train_test_split(df_train, test_size=0.1)
+# Dividir df_train en conjuntos de entrenamiento y validación
+train_df, val_df = train_test_split(df_train, test_size=0.1, random_state=42)
+
+# Obtener la lista de características tabulares después de la ingeniería de características
+TABULAR_FEATURES = [col for col in train_df.columns if col not in ['image_path'] + TARGET_NAMES]
+N_FEATURES = len(TABULAR_FEATURES)
 
 
 def preprocess_image(image_path):
@@ -77,9 +90,7 @@ def preprocess_image(image_path):
 def create_dataset(df):
     """Crea un tf.data.Dataset desde el dataframe ancho."""
     
-    # [POR HACER] Actualiza esto para que coincida con tus features tabulares
-    # (ej. NDVI, Altura, Estado_one_hot, Especie_one_hot, etc.)
-    tabular_features = df[['Pre_GSHH_NDVI', 'Height_Ave_cm']].values
+    tabular_features = df[TABULAR_FEATURES].values
     
     image_paths = df['image_path'].values
     targets = df[TARGET_NAMES].values
@@ -97,16 +108,20 @@ def create_dataset(df):
     # Combinar en un dataset de ( (img, tab), tgt )
     ds = tf.data.Dataset.zip(( (ds_img, ds_tab), ds_tgt ))
     
-    # [POR HACER] Aplicar aumento de datos (data augmentation) aquí en `ds_img`
-    # (ej. flips, rotaciones)
+    # --- Aumento de Datos ---
+    data_augmentation = tf.keras.Sequential([
+        layers.RandomFlip("horizontal_and_vertical"),
+        layers.RandomRotation(0.2),
+    ])
+
+    ds = ds.map(lambda x, y: ( (data_augmentation(x[0]), x[1]), y), num_parallel_calls=tf.data.AUTOTUNE)
     
     ds = ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
     return ds
 
-# Crear los datasets (usamos el df completo como ejemplo)
-# Deberías usar train_df y val_df separados
-train_ds = create_dataset(df_train)
-# val_ds = create_dataset(val_df)
+# Crear los datasets de entrenamiento y validación
+train_ds = create_dataset(train_df)
+val_ds = create_dataset(val_df)
 
 
 # --- 3. FUNCIÓN DE PÉRDIDA PERSONALIZADA ---
@@ -145,9 +160,10 @@ def build_model(n_tabular_features):
     
     base_model = EfficientNetB0(
         include_top=False, 
-        weights='imagenet', # ¡CAMBIAR ESTO!
+        weights=None,
         input_tensor=image_input
     )
+    base_model.load_weights('../input/efficientnetb0-keras-weights/efficientnetb0_notop.h5')
     base_model.trainable = False # Empezar congelando el 'backbone'
     
     # Cabezal de la CNN
@@ -159,10 +175,12 @@ def build_model(n_tabular_features):
     # --- Rama 2: Entrada Tabular (MLP) ---
     tabular_input = layers.Input(shape=(n_tabular_features,), name='tabular_input')
     
-    # [POR HACER] Normalizar los datos tabulares antes de pasarlos al modelo
-    # (usando una capa de Normalization o pre-procesándolos)
+    # Capa de Normalización
+    normalizer = layers.Normalization(name='normalizer')
+    normalizer.adapt(train_df[TABULAR_FEATURES].values)
     
-    x_tab = layers.Dense(32, activation='relu')(tabular_input)
+    x_tab = normalizer(tabular_input)
+    x_tab = layers.Dense(32, activation='relu')(x_tab)
     x_tab = layers.Dense(16, activation='relu')(x_tab)
 
     
@@ -172,7 +190,7 @@ def build_model(n_tabular_features):
     # --- Cabezal de Regresión (Head) ---
     x = layers.Dense(64, activation='relu')(concatenated)
     x = layers.Dropout(0.4)(x)
-    output = layers.Dense(N_TARGETS, activation='linear', name='output')(output) # 'linear' para regresión
+    output = layers.Dense(N_TARGETS, activation='linear', name='output')(x) # 'linear' para regresión
     
     # [Opcional] Usar 'relu' si la biomasa nunca puede ser negativa
     # output = layers.Dense(N_TARGETS, activation='relu', name='output')(x)
@@ -202,13 +220,15 @@ model.summary()
 # --- 5. ENTRENAMIENTO ---
 
 print("Iniciando entrenamiento...")
-# [POR HACER] Descomentar para entrenar y añadir el 'val_ds'
-# history = model.fit(
-#     train_ds,
-#     epochs=EPOCHS,
-#     # validation_data=val_ds 
-# )
-print("Entrenamiento (simulado) completado.")
+early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+
+history = model.fit(
+    train_ds,
+    epochs=50, # Aumentar épocas
+    validation_data=val_ds,
+    callbacks=[early_stopping]
+)
+print("Entrenamiento completado.")
 
 
 # --- 6. PREDICCIÓN Y SUMISIÓN ---
@@ -216,10 +236,22 @@ print("Entrenamiento (simulado) completado.")
 print("Generando predicciones de sumisión...")
 df_test_long = pd.read_csv(TEST_CSV_PATH)
 
-# [POR HACER] Necesitas procesar los features tabulares del test set
-# de la misma forma que lo hiciste con el train set.
-# Por ahora, usamos los mismos features numéricos.
-df_test_features = df_test_long.groupby('image_path')[['Pre_GSHH_NDVI', 'Height_Ave_cm']].mean().reset_index()
+# Aplicar la misma ingeniería de características al conjunto de prueba
+df_test_long['Sampling_Date'] = pd.to_datetime(df_test_long['Sampling_Date'])
+df_test_long['day_of_year'] = df_test_long['Sampling_Date'].dt.dayofyear
+df_test_long = pd.get_dummies(df_test_long, columns=['State', 'Species'], prefix=['State', 'Species'])
+
+# Alinear columnas con el conjunto de entrenamiento (importante para one-hot encoding)
+train_cols = set(train_df.columns)
+test_cols = set(df_test_long.columns)
+
+missing_in_test = list(train_cols - test_cols)
+for col in missing_in_test:
+    if col.startswith('State_') or col.startswith('Species_'):
+        df_test_long[col] = 0
+
+# Asegurarse de que el orden de las columnas sea el mismo
+df_test_features = df_test_long.groupby('image_path')[TABULAR_FEATURES].first().reset_index()
 
 # El test.csv tiene múltiples filas por imagen, pero solo necesitamos predecir UNA VEZ por imagen
 df_test_unique_images = df_test_features.drop_duplicates(subset=['image_path'])
@@ -227,8 +259,7 @@ df_test_unique_images = df_test_features.drop_duplicates(subset=['image_path'])
 def create_test_dataset(df):
     """Crea un dataset para inferencia (solo inputs)."""
     
-    # [POR HACER] Actualiza esto para que coincida con tus features tabulares
-    tabular_features = df[['Pre_GSHH_NDVI', 'Height_Ave_cm']].values
+    tabular_features = df[TABULAR_FEATURES].values
     
     image_paths = df['image_path'].values
     

@@ -182,8 +182,8 @@ def build_model():
         weights=None,
         input_tensor=image_input
     )
-    # ATENCIÓN: Asegúrate de añadir el dataset "EfficientNet Keras Weights B0-B5" a tu notebook.
-    base_model.load_weights('../input/efficientnet-keras-weights-b0b5/efficientnet-b3_imagenet_1000_notop.h5', by_name=True)
+    # Cargando los pesos de EfficientNetB3 Noisy Student que ya están en el notebook.
+    base_model.load_weights('/kaggle/input/tf-efficientnet-noisy-student-weights/efficientnet-b3_noisy-student_notop.h5', by_name=True)
     base_model.trainable = False # Empezar congelando el 'backbone'
 
     # Cabezal del Modelo

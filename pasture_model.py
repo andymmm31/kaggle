@@ -243,6 +243,19 @@ print("Entrenamiento completado.")
 print("Generando predicciones de sumisión...")
 df_test_long = pd.read_csv(TEST_CSV_PATH)
 
+# --- Lógica de Relleno para el Entorno de Prueba ---
+# Comprueba si las columnas de características existen. Si no, las crea con valores de relleno.
+if 'Sampling_Date' not in df_test_long.columns:
+    print("El test.csv no tiene características. Creando valores de relleno para la ejecución...")
+    # Usamos la fecha actual como relleno
+    df_test_long['Sampling_Date'] = pd.to_datetime('today')
+    # Rellenamos las columnas categóricas originales antes del one-hot encoding
+    df_test_long['State'] = 'VIC' # Relleno con un valor común
+    df_test_long['Species'] = 'RYEGRASS' # Relleno con un valor común
+    # Rellenamos las características numéricas con la media del conjunto de entrenamiento
+    df_test_long['Pre_GSHH_NDVI'] = train_df['Pre_GSHH_NDVI'].mean()
+    df_test_long['Height_Ave_cm'] = train_df['Height_Ave_cm'].mean()
+
 # Aplicar la misma ingeniería de características al conjunto de prueba
 df_test_long['Sampling_Date'] = pd.to_datetime(df_test_long['Sampling_Date'])
 df_test_long['day_of_year'] = df_test_long['Sampling_Date'].dt.dayofyear

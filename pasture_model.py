@@ -75,8 +75,8 @@ df_train = load_and_pivot_data()
 train_df, val_df = train_test_split(df_train, test_size=0.1, random_state=42)
 
 # Crear rutas de imagen completas
-train_df['image_path'] = train_df['image_path'].apply(lambda x: os.path.join(TRAIN_IMG_PATH, x))
-val_df['image_path'] = val_df['image_path'].apply(lambda x: os.path.join(TRAIN_IMG_PATH, x))
+train_df['image_path'] = train_df['image_path'].apply(lambda x: os.path.join(BASE_PATH, x))
+val_df['image_path'] = val_df['image_path'].apply(lambda x: os.path.join(BASE_PATH, x))
 
 # Obtener la lista de características tabulares después de la ingeniería de características
 TABULAR_FEATURES = [col for col in train_df.columns if col not in ['image_path'] + TARGET_NAMES]
@@ -264,7 +264,7 @@ df_test_features = df_test_long.groupby('image_path')[TABULAR_FEATURES].first().
 df_test_unique_images = df_test_features.drop_duplicates(subset=['image_path'])
 
 # Crear rutas de imagen completas para el conjunto de prueba
-df_test_unique_images['image_path'] = df_test_unique_images['image_path'].apply(lambda x: os.path.join(TEST_IMG_PATH, x))
+df_test_unique_images['image_path'] = df_test_unique_images['image_path'].apply(lambda x: os.path.join(BASE_PATH, x))
 
 # Asegurarse de que todas las características tabulares sean float32 en el conjunto de prueba
 for col in TABULAR_FEATURES:

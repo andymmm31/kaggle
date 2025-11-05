@@ -74,14 +74,18 @@ df_train = load_and_pivot_data()
 # Dividir df_train en conjuntos de entrenamiento y validación
 train_df, val_df = train_test_split(df_train, test_size=0.1, random_state=42)
 
+# Crear rutas de imagen completas
+train_df['image_path'] = train_df['image_path'].apply(lambda x: os.path.join(TRAIN_IMG_PATH, x))
+val_df['image_path'] = val_df['image_path'].apply(lambda x: os.path.join(TRAIN_IMG_PATH, x))
+
 # Obtener la lista de características tabulares después de la ingeniería de características
 TABULAR_FEATURES = [col for col in train_df.columns if col not in ['image_path'] + TARGET_NAMES]
 N_FEATURES = len(TABULAR_FEATURES)
 
 
 def preprocess_image(image_path):
-    """Carga y pre-procesa una imagen."""
-    img = tf.io.read_file(os.path.join(TRAIN_IMG_PATH, image_path))
+    """Carga y pre-procesa una imagen desde una ruta completa."""
+    img = tf.io.read_file(image_path)
     img = tf.image.decode_jpeg(img, channels=3)
     img = tf.image.resize(img, [IMG_SIZE, IMG_SIZE])
     img = tf.keras.applications.efficientnet.preprocess_input(img) # Normalización de EfficientNet
@@ -256,6 +260,9 @@ df_test_features = df_test_long.groupby('image_path')[TABULAR_FEATURES].first().
 # El test.csv tiene múltiples filas por imagen, pero solo necesitamos predecir UNA VEZ por imagen
 df_test_unique_images = df_test_features.drop_duplicates(subset=['image_path'])
 
+# Crear rutas de imagen completas para el conjunto de prueba
+df_test_unique_images['image_path'] = df_test_unique_images['image_path'].apply(lambda x: os.path.join(TEST_IMG_PATH, x))
+
 def create_test_dataset(df):
     """Crea un dataset para inferencia (solo inputs)."""
     
@@ -263,16 +270,9 @@ def create_test_dataset(df):
     
     image_paths = df['image_path'].values
     
-    # Pre-procesar imágenes (desde la carpeta de test)
-    def preprocess_test_image(image_path):
-        img = tf.io.read_file(os.path.join(TEST_IMG_PATH, image_path)) # ¡Ruta de TEST!
-        img = tf.image.decode_jpeg(img, channels=3)
-        img = tf.image.resize(img, [IMG_SIZE, IMG_SIZE])
-        img = tf.keras.applications.efficientnet.preprocess_input(img)
-        return img
-
+    # La función de preprocesamiento de entrenamiento funciona aquí también, ya que ahora toma rutas completas
     ds_img = tf.data.Dataset.from_tensor_slices(image_paths)
-    ds_img = ds_img.map(preprocess_test_image, num_parallel_calls=tf.data.AUTOTUNE)
+    ds_img = ds_img.map(preprocess_image, num_parallel_calls=tf.data.AUTOTUNE)
     
     ds_tab = tf.data.Dataset.from_tensor_slices(tabular_features)
     
@@ -300,7 +300,8 @@ df_preds_long = df_preds_wide.melt(
 )
 
 # Crear el 'sample_id'
-df_preds_long['sample_id'] = df_preds_long['image_path'].str.replace('test/', '', regex=False) + '__' + df_preds_long['target_name']
+df_preds_long['image_path_basename'] = df_preds_long['image_path'].apply(os.path.basename)
+df_preds_long['sample_id'] = df_preds_long['image_path_basename'] + '__' + df_preds_long['target_name']
 
 # Generar el archivo de sumisión
 # Nos aseguramos de tener el mismo orden y columnas que sample_submission.csv

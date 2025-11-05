@@ -90,8 +90,8 @@ def create_dataset(df):
         layers.RandomFlip("horizontal_and_vertical"),
         layers.RandomRotation(0.2),
         layers.RandomZoom(0.2),
-        layers.RandomBrightness(0.2),
-        layers.RandomContrast(0.2),
+        layers.RandomBrightness(0.1), # Reducido de 0.2
+        layers.RandomContrast(0.1),  # Reducido de 0.2
     ])
 
     # Aplicar aumento solo a la imagen
@@ -223,7 +223,7 @@ FINE_TUNE_LR = 1e-5
 
 # --- Fase 1: Entrenar solo el cabezal (con el modelo base congelado) ---
 print("--- Iniciando Fase 1: Entrenamiento del Cabezal ---")
-early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True)
+early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=8, restore_best_weights=True)
 
 history = model.fit(
     train_ds,
@@ -232,10 +232,14 @@ history = model.fit(
     callbacks=[early_stopping]
 )
 
-# --- Fase 2: Descongelar y hacer Fine-Tuning ---
-print("\n--- Iniciando Fase 2: Fine-Tuning del Modelo Completo ---")
-# Descongelar el modelo base
-model.trainable = True
+# --- Fase 2: Descongelar y hacer Fine-Tuning Parcial ---
+print("\n--- Iniciando Fase 2: Fine-Tuning Parcial ---")
+# Descongelar las capas superiores del modelo base
+base_model.trainable = True
+
+# Congelamos todas las capas excepto las últimas 20
+for layer in base_model.layers[:-20]:
+    layer.trainable = False
 
 # Volver a compilar el modelo con una tasa de aprendizaje muy baja
 model.compile(

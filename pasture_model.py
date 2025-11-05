@@ -10,7 +10,7 @@ from sklearn.model_selection import train_test_split
 # --- 1. CONFIGURACIÓN Y CONSTANTES ---
 
 # Rutas de Kaggle (basado en tu captura de pantalla)
-BASE_PATH = '/kaggle/input/csiro-image2biomass-prediction'
+BASE_PATH = '/kaggle/input/csiro-biomass'
 TRAIN_IMG_PATH = os.path.join(BASE_PATH, 'train')
 TEST_IMG_PATH = os.path.join(BASE_PATH, 'test')
 TRAIN_CSV_PATH = os.path.join(BASE_PATH, 'train.csv')

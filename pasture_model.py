@@ -213,8 +213,6 @@ def build_model(n_tabular_features):
     
     return model
 
-# [POR HACER] Asegúrate que este número coincida con tus features tabulares
-N_FEATURES = 2 # (NDVI, Height)
 model = build_model(n_tabular_features=N_FEATURES)
 
 # Compilar el modelo con la pérdida personalizada

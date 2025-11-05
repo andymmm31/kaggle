@@ -172,7 +172,7 @@ def build_model(n_tabular_features):
         weights=None,
         input_tensor=image_input
     )
-    base_model.load_weights('/kaggle/input/tf-efficientnet-noisy-student-weights/efficientnet-b0_noisy-student_notop.h5')
+    base_model.load_weights('/kaggle/input/tf-efficientnet-noisy-student-weights/efficientnet-b0_noisy-student_notop.h5', by_name=True)
     base_model.trainable = False # Empezar congelando el 'backbone'
     
     # Cabezal de la CNN

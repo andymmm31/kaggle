@@ -89,6 +89,9 @@ def create_dataset(df):
     data_augmentation = tf.keras.Sequential([
         layers.RandomFlip("horizontal_and_vertical"),
         layers.RandomRotation(0.2),
+        layers.RandomZoom(0.2),
+        layers.RandomBrightness(0.2),
+        layers.RandomContrast(0.2),
     ])
 
     # Aplicar aumento solo a la imagen
@@ -210,18 +213,47 @@ model.compile(
 model.summary()
 
 
-# --- 5. ENTRENAMIENTO ---
+# --- 5. ENTRENAMIENTO Y FINE-TUNING ---
 
-print("Iniciando entrenamiento...")
-early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+# Hiperparámetros para el entrenamiento
+INITIAL_EPOCHS = 20
+FINE_TUNE_EPOCHS = 80
+TOTAL_EPOCHS = INITIAL_EPOCHS + FINE_TUNE_EPOCHS
+FINE_TUNE_LR = 1e-5
+
+# --- Fase 1: Entrenar solo el cabezal (con el modelo base congelado) ---
+print("--- Iniciando Fase 1: Entrenamiento del Cabezal ---")
+early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True)
 
 history = model.fit(
     train_ds,
-    epochs=50, # Aumentar épocas
+    epochs=INITIAL_EPOCHS,
     validation_data=val_ds,
     callbacks=[early_stopping]
 )
-print("Entrenamiento completado.")
+
+# --- Fase 2: Descongelar y hacer Fine-Tuning ---
+print("\n--- Iniciando Fase 2: Fine-Tuning del Modelo Completo ---")
+# Descongelar el modelo base
+model.trainable = True
+
+# Volver a compilar el modelo con una tasa de aprendizaje muy baja
+model.compile(
+    optimizer=keras.optimizers.Adam(learning_rate=FINE_TUNE_LR),
+    loss=weighted_mse_loss,
+    metrics=[WeightedR2Score()]
+)
+
+# Continuar el entrenamiento
+history_fine = model.fit(
+    train_ds,
+    epochs=TOTAL_EPOCHS,
+    initial_epoch=history.epoch[-1], # Continuar desde donde lo dejamos
+    validation_data=val_ds,
+    callbacks=[early_stopping] # Reutilizamos el mismo callback
+)
+
+print("Entrenamiento y Fine-Tuning completados.")
 
 
 # --- 6. PREDICCIÓN Y SUMISIÓN ---

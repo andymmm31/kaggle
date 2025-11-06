@@ -20,7 +20,8 @@ TEST_CSV_PATH = os.path.join(BASE_PATH, 'test.csv')
 IMG_SIZE = 300 # Tamaño para EfficientNetB3
 BATCH_SIZE = 16 # Reducido para B3 y imágenes más grandes
 LEARNING_RATE = 0.001
-EPOCHS = 10 # Empezar con pocas para probar
+WARMUP_EPOCHS = 5
+FINETUNE_EPOCHS = 25 # Máximo, EarlyStopping decidirá
 TARGET_NAMES = ['Dry_Green_g', 'Dry_Dead_g', 'Dry_Clover_g', 'GDM_g', 'Dry_Total_g']
 N_TARGETS = len(TARGET_NAMES)
 
@@ -196,7 +197,6 @@ def build_model():
 
 # --- 5. ENTRENAMIENTO CON CROSS-VALIDATION ---
 N_FOLDS = 5
-EPOCHS = 60 # Épocas por fold
 kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=42)
 
 for fold, (train_idx, val_idx) in enumerate(kf.split(df_train)):
@@ -210,28 +210,46 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(df_train)):
     train_ds = create_dataset(train_df_fold, is_train=True)
     val_ds = create_dataset(val_df_fold, is_train=False) # No aumentar datos en validación
 
-    # Construir y compilar un modelo nuevo para cada fold
+    # Construir un modelo nuevo para cada fold
     model, base_model = build_model()
 
-    # Descongelar para fine-tuning
-    base_model.trainable = True
-    for layer in base_model.layers[:-40]:
-        layer.trainable = False
-
+    # --- FASE 1: Calentamiento (Head-only training) ---
+    print("--- Iniciando Fase 1: Calentamiento ---")
     model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=LEARNING_RATE),
         loss=weighted_mse_loss,
         metrics=[WeightedR2Score()]
     )
 
-    # Callbacks
-    early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
-    reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.1, patience=5, verbose=1)
+    model.fit(
+        train_ds,
+        epochs=WARMUP_EPOCHS,
+        validation_data=val_ds,
+        callbacks=[] # Sin callbacks en esta fase
+    )
+
+    # --- FASE 2: Fine-Tuning ---
+    print("\n--- Iniciando Fase 2: Fine-Tuning ---")
+    # Descongelar las capas superiores del base_model
+    base_model.trainable = True
+    for layer in base_model.layers[:-40]:
+        layer.trainable = False
+
+    # Re-compilar con una tasa de aprendizaje más baja
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=LEARNING_RATE / 10),
+        loss=weighted_mse_loss,
+        metrics=[WeightedR2Score()]
+    )
+
+    # Callbacks para el fine-tuning
+    early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=7, restore_best_weights=True)
+    reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.1, patience=3, verbose=1)
 
     # Entrenar el modelo
     model.fit(
         train_ds,
-        epochs=EPOCHS,
+        epochs=FINETUNE_EPOCHS,
         validation_data=val_ds,
         callbacks=[early_stopping, reduce_lr]
     )
@@ -249,41 +267,52 @@ df_test_long = pd.read_csv(TEST_CSV_PATH)
 df_test_unique_images = df_test_long[['image_path']].drop_duplicates()
 df_test_unique_images['image_path'] = df_test_unique_images['image_path'].apply(lambda x: os.path.join(BASE_PATH, x))
 
-def create_test_dataset(df, augment=False):
-    """Crea un dataset de test, con opción de aumento para TTA."""
+def create_test_dataset(df, tta_mode='none'):
+    """
+    Crea un dataset de test, con opción de aumento para TTA.
+    tta_mode: 'none', 'hflip', 'vflip', 'hvflip'
+    """
     ds = tf.data.Dataset.from_tensor_slices(df['image_path'].values)
     ds = ds.map(preprocess_image, num_parallel_calls=tf.data.AUTOTUNE)
 
-    if augment:
-        # Para TTA, solo usaremos un aumento simple como el volteo horizontal
-        ds = ds.map(lambda img: tf.image.random_flip_left_right(img), num_parallel_calls=tf.data.AUTOTUNE)
+    if tta_mode == 'hflip':
+        ds = ds.map(lambda img: tf.image.flip_left_right(img), num_parallel_calls=tf.data.AUTOTUNE)
+    elif tta_mode == 'vflip':
+        ds = ds.map(lambda img: tf.image.flip_up_down(img), num_parallel_calls=tf.data.AUTOTUNE)
+    elif tta_mode == 'hvflip':
+        ds = ds.map(lambda img: tf.image.flip_left_right(img), num_parallel_calls=tf.data.AUTOTUNE)
+        ds = ds.map(lambda img: tf.image.flip_up_down(img), num_parallel_calls=tf.data.AUTOTUNE)
 
     ds = ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
     return ds
 
-# Crear datasets de test (original y aumentado para TTA)
-test_ds_original = create_test_dataset(df_test_unique_images, augment=False)
-test_ds_augmented = create_test_dataset(df_test_unique_images, augment=True)
-
 # Construir un modelo solo para cargar los pesos
 inference_model, _ = build_model()
-all_preds = []
+all_fold_preds = []
 
 for fold in range(N_FOLDS):
     print(f"Prediciendo con modelo del Fold {fold+1}/{N_FOLDS}...")
     inference_model.load_weights(f'model_fold_{fold}.weights.h5')
 
-    # Predecir en imágenes originales
+    # TTA: Predecir en 4 versiones de la imagen
+    test_ds_original = create_test_dataset(df_test_unique_images, tta_mode='none')
     preds_original = inference_model.predict(test_ds_original)
-    # Predecir en imágenes aumentadas (TTA)
-    preds_augmented = inference_model.predict(test_ds_augmented)
 
-    # Promediar las predicciones de TTA y añadir a la lista
-    avg_preds = (preds_original + preds_augmented) / 2.0
-    all_preds.append(avg_preds)
+    test_ds_hflip = create_test_dataset(df_test_unique_images, tta_mode='hflip')
+    preds_hflip = inference_model.predict(test_ds_hflip)
+
+    test_ds_vflip = create_test_dataset(df_test_unique_images, tta_mode='vflip')
+    preds_vflip = inference_model.predict(test_ds_vflip)
+
+    test_ds_hvflip = create_test_dataset(df_test_unique_images, tta_mode='hvflip')
+    preds_hvflip = inference_model.predict(test_ds_hvflip)
+
+    # Promediar las predicciones de TTA para este fold
+    avg_preds_fold = (preds_original + preds_hflip + preds_vflip + preds_hvflip) / 4.0
+    all_fold_preds.append(avg_preds_fold)
 
 # Promediar las predicciones de todos los folds (Ensemble)
-final_preds = np.mean(all_preds, axis=0)
+final_preds = np.mean(all_fold_preds, axis=0)
 
 # --- Generar archivo de sumisión (misma lógica que antes) ---
 df_preds_wide = pd.DataFrame(final_preds, columns=TARGET_NAMES)

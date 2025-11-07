@@ -8,7 +8,7 @@ import os
 from sklearn.model_selection import KFold
 
 # --- 1. CONFIGURACIÓN Y CONSTANTES ---
-BASE_PATH = '/kaggle/input/csiro-biomass-challenge' # Corregido basado en inferencia
+BASE_PATH = '/kaggle/input/csiro-biomass-challenge'
 TRAIN_IMG_PATH = os.path.join(BASE_PATH, 'train')
 TEST_IMG_PATH = os.path.join(BASE_PATH, 'test')
 TRAIN_CSV_PATH = os.path.join(BASE_PATH, 'train.csv')
@@ -92,7 +92,8 @@ def weighted_mse_loss(y_true, y_pred):
 def build_model():
     image_input = layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3), name='image_input')
     base_model = EfficientNetB3(include_top=False, weights=None, input_tensor=image_input)
-    base_model.load_weights('/kaggle/input/tf-efficientnet-noisy-student-weights/efficientnet-b3_noisy-student_notop.h5', by_name=True)
+    # Asumiendo que los pesos están en un dataset adjunto con este nombre
+    base_model.load_weights('/kaggle/input/efficientnetb3-notop-h5/efficientnetb3_notop.h5', by_name=True)
     base_model.trainable = False
     x = layers.GlobalAveragePooling2D()(base_model.output)
     x = layers.Dense(256, activation='relu')(x)

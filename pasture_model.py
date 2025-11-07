@@ -20,7 +20,7 @@ TEST_CSV_PATH = os.path.join(BASE_PATH, 'test.csv')
 IMG_SIZE = 300 # Tamaño para EfficientNetB3
 BATCH_SIZE = 16 # Reducido para B3 y imágenes más grandes
 LEARNING_RATE = 0.001
-EPOCHS = 30 # Aumentado para dar más tiempo de entrenamiento
+EPOCHS = 10 # Empezar con pocas para probar
 TARGET_NAMES = ['Dry_Green_g', 'Dry_Dead_g', 'Dry_Clover_g', 'GDM_g', 'Dry_Total_g']
 N_TARGETS = len(TARGET_NAMES)
 
@@ -31,27 +31,62 @@ LOSS_WEIGHTS = tf.constant([0.1, 0.1, 0.1, 0.2, 0.5])
 
 # --- 2. PRE-PROCESAMIENTO DE DATOS ---
 
-def load_and_pivot_data():
-    """Carga train.csv y lo pivota a formato ancho, solo con targets."""
+def load_and_process_data():
+    """Carga train.csv, pivota los targets y conserva los metadatos."""
     df_train_long = pd.read_csv(TRAIN_CSV_PATH)
 
-    # Pivoteamos los targets para tener una fila por imagen
-    df_train_wide = df_train_long.pivot(
-        index='image_path',
-        columns='target_name',
-        values='target'
-    ).reset_index()
+    # Pivota los targets
+    df_targets = df_train_long.pivot(index='image_path', columns='target_name', values='target').reset_index()
 
-    # Quitar filas con targets faltantes
+    # Obtiene los metadatos únicos por imagen
+    df_meta = df_train_long[['image_path', 'Sampling_Date', 'State', 'Species', 'Pre_GSHH_NDVI', 'Height_Ave_cm']].drop_duplicates()
+
+    # Une los targets y los metadatos
+    df_train_wide = pd.merge(df_meta, df_targets, on='image_path')
+
+    # Elimina filas con valores faltantes
     df_train_wide = df_train_wide.dropna()
 
-    print(f"Datos 'anchos' para entrenamiento: {df_train_wide.shape}")
+    print(f"Datos de entrenamiento procesados: {df_train_wide.shape}")
     print(df_train_wide.head())
 
     return df_train_wide
 
 # Cargar los datos
-df_train = load_and_pivot_data()
+df_train = load_and_process_data()
+
+# --- INGENIERÍA DE CARACTERÍSTICAS ---
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+def feature_engineer(df):
+    # Procesamiento de Fechas
+    df['Sampling_Date'] = pd.to_datetime(df['Sampling_Date'])
+    df['day_of_year'] = df['Sampling_Date'].dt.dayofyear
+    df['day_of_year_sin'] = np.sin(2 * np.pi * df['day_of_year']/365.25)
+    df['day_of_year_cos'] = np.cos(2 * np.pi * df['day_of_year']/365.25)
+    return df
+
+print("Aplicando ingeniería de características al conjunto de entrenamiento...")
+df_train = feature_engineer(df_train)
+
+# One-Hot Encoding para categóricas
+categorical_features = ['State', 'Species']
+encoder = OneHotEncoder(handle_unknown='ignore', sparse_output=False)
+encoder.fit(df_train[categorical_features])
+encoded_cols = encoder.get_feature_names_out(categorical_features)
+df_train[encoded_cols] = encoder.transform(df_train[categorical_features])
+
+# Normalización para numéricas
+numerical_features = ['Pre_GSHH_NDVI', 'Height_Ave_cm']
+scaler = StandardScaler()
+scaler.fit(df_train[numerical_features])
+df_train[numerical_features] = scaler.transform(df_train[numerical_features])
+
+# Lista final de meta-features
+META_FEATURES = ['day_of_year_sin', 'day_of_year_cos'] + numerical_features + list(encoded_cols)
+N_META_FEATURES = len(META_FEATURES)
+
+print(f"Número total de meta-features: {N_META_FEATURES}")
 
 # Crear rutas de imagen completas
 df_train['image_path'] = df_train['image_path'].apply(lambda x: os.path.join(BASE_PATH, x))
@@ -65,32 +100,30 @@ def preprocess_image(image_path):
     img = tf.keras.applications.efficientnet.preprocess_input(img) # Normalización de EfficientNet
     return img
 
-def create_dataset(df, is_train=True):
-    """Crea un tf.data.Dataset de (imagen, target) desde el dataframe."""
+def create_dataset(df, meta_features, is_train=True):
+    """Crea un tf.data.Dataset para el modelo multi-modal."""
 
-    image_paths = df['image_path'].values
-    targets = df[TARGET_NAMES].values
+    # Datasets de entradas
+    ds_img = tf.data.Dataset.from_tensor_slices(df['image_path'].values).map(preprocess_image, num_parallel_calls=tf.data.AUTOTUNE)
+    ds_meta = tf.data.Dataset.from_tensor_slices(meta_features.astype(np.float32))
 
-    # Dataset de rutas de imágenes
-    ds_img = tf.data.Dataset.from_tensor_slices(image_paths)
-    ds_img = ds_img.map(preprocess_image, num_parallel_calls=tf.data.AUTOTUNE)
+    # Combinar las entradas en un diccionario
+    ds_inputs = tf.data.Dataset.zip(({'image_input': ds_img, 'meta_input': ds_meta}))
 
     # Dataset de targets
-    ds_tgt = tf.data.Dataset.from_tensor_slices(targets)
+    ds_tgt = tf.data.Dataset.from_tensor_slices(df[TARGET_NAMES].values.astype(np.float32))
 
-    # Combinar en un dataset de (img, tgt)
-    ds = tf.data.Dataset.zip((ds_img, ds_tgt))
+    # Combinar (entradas, targets)
+    ds = tf.data.Dataset.zip((ds_inputs, ds_tgt))
 
-    # Aplicar aumento de datos solo al set de entrenamiento
     if is_train:
         data_augmentation = tf.keras.Sequential([
             layers.RandomFlip("horizontal_and_vertical"),
             layers.RandomRotation(0.2),
-            layers.RandomZoom(0.2),
-            layers.RandomBrightness(0.1),
-            layers.RandomContrast(0.1),
         ])
-        ds = ds.map(lambda img, tgt: (data_augmentation(img), tgt), num_parallel_calls=tf.data.AUTOTUNE)
+        # Aplicar aumento solo a la imagen
+        ds = ds.map(lambda inputs, tgt: ({'image_input': data_augmentation(inputs['image_input']), 'meta_input': inputs['meta_input']}, tgt),
+                    num_parallel_calls=tf.data.AUTOTUNE)
 
     ds = ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
     return ds
@@ -99,50 +132,44 @@ def create_dataset(df, is_train=True):
 # --- 3. MÉTRICA Y FUNCIÓN DE PÉRDIDA PERSONALIZADAS ---
 
 class WeightedR2Score(tf.keras.metrics.Metric):
-    """
-    Calcula el R² score global ponderado.
-    La fórmula es: 1 - (sum(w*(y_true-y_pred)^2) / sum(w*(y_true-y_mean)^2))
-    donde y_mean es la media global de y_true para cada target.
-    """
+    """Métrica R² ponderada alineada con la competición."""
     def __init__(self, name='weighted_r2_score', **kwargs):
         super().__init__(name=name, **kwargs)
         self.weights = tf.constant([0.1, 0.1, 0.1, 0.2, 0.5], dtype=tf.float32)
-
-        # Variables de estado para calcular SS_res
-        self.sum_ss_res = self.add_weight(name='sum_ss_res', initializer='zeros')
-
-        # Variables de estado para calcular SS_tot (usando la fórmula expandida)
-        self.sum_y_true = self.add_weight(name='sum_y_true', shape=(N_TARGETS,), initializer='zeros')
-        self.sum_y_true_sq = self.add_weight(name='sum_y_true_sq', shape=(N_TARGETS,), initializer='zeros')
+        self.y_true_sum = self.add_weight(name='y_true_sum', shape=(N_TARGETS,), initializer='zeros')
+        self.y_true_sq_sum = self.add_weight(name='y_true_sq_sum', shape=(N_TARGETS,), initializer='zeros')
+        self.y_pred_sq_sum = self.add_weight(name='y_pred_sq_sum', shape=(N_TARGETS,), initializer='zeros')
         self.count = self.add_weight(name='count', initializer='zeros')
 
     def update_state(self, y_true, y_pred, sample_weight=None):
-        y_true = tf.cast(y_true, tf.float32)
-        y_pred = tf.cast(y_pred, tf.float32)
+        y_true = tf.cast(y_true, self.dtype)
+        y_pred = tf.cast(y_pred, self.dtype)
 
-        # Actualizar sumas para SS_res
-        ss_res = tf.reduce_sum(self.weights * tf.square(y_true - y_pred))
-        self.sum_ss_res.assign_add(ss_res)
-
-        # Actualizar sumas para SS_tot
-        self.sum_y_true.assign_add(tf.reduce_sum(y_true, axis=0))
-        self.sum_y_true_sq.assign_add(tf.reduce_sum(tf.square(y_true), axis=0))
-        self.count.assign_add(tf.cast(tf.shape(y_true)[0], tf.float32))
+        self.y_true_sum.assign_add(tf.reduce_sum(y_true, axis=0))
+        self.y_true_sq_sum.assign_add(tf.reduce_sum(tf.square(y_true), axis=0))
+        self.y_pred_sq_sum.assign_add(tf.reduce_sum(tf.square(y_true - y_pred), axis=0))
+        self.count.assign_add(tf.cast(tf.shape(y_true)[0], self.dtype))
 
     def result(self):
-        # Calcular SS_tot a partir de las sumas acumuladas
-        # SS_tot = sum(w * (sum(y^2) - (sum(y))^2 / N))
-        ss_tot_per_target = self.sum_y_true_sq - (tf.square(self.sum_y_true) / self.count)
-        total_ss_tot = tf.reduce_sum(self.weights * ss_tot_per_target)
+        y_true_mean = self.y_true_sum / self.count
 
-        # Evitar división por cero
-        return 1.0 - (self.sum_ss_res / (total_ss_tot + tf.keras.backend.epsilon()))
+        # Media ponderada global de y_true
+        weighted_mean = tf.reduce_sum(y_true_mean * self.weights)
+
+        # Suma de cuadrados residual (SS_res)
+        ss_res = tf.reduce_sum(self.y_pred_sq_sum * self.weights)
+
+        # Suma de cuadrados total (SS_tot)
+        ss_tot = tf.reduce_sum(tf.square(self.y_true_sum - weighted_mean) * self.weights)
+        ss_tot_alternative = tf.reduce_sum((self.y_true_sq_sum - 2 * self.y_true_sum * weighted_mean + self.count * tf.square(weighted_mean)) * self.weights)
+
+        return 1 - (ss_res / (ss_tot_alternative + tf.keras.backend.epsilon()))
 
     def reset_state(self):
-        self.sum_ss_res.assign(0.0)
-        self.sum_y_true.assign(tf.zeros(shape=(N_TARGETS,)))
-        self.sum_y_true_sq.assign(tf.zeros(shape=(N_TARGETS,)))
-        self.count.assign(0.0)
+        self.y_true_sum.assign(tf.zeros_like(self.y_true_sum))
+        self.y_true_sq_sum.assign(tf.zeros_like(self.y_true_sq_sum))
+        self.y_pred_sq_sum.assign(tf.zeros_like(self.y_pred_sq_sum))
+        self.count.assign(0.)
 
 
 def weighted_mse_loss(y_true, y_pred):
@@ -160,38 +187,32 @@ def weighted_mse_loss(y_true, y_pred):
     return tf.reduce_mean(weighted_error_sq)
 
 
-# --- 4. ARQUITECTURA DEL MODELO MULTIMODAL ---
+# --- 4. ARQUITECTURA DEL MODELO MULTI-MODAL ---
 
 def build_model():
-    """Construye el modelo de solo visión (CNN) usando EfficientNetB3."""
+    """Construye el modelo multi-modal (CNN + MLP)."""
 
-    # --- Entrada de Imagen (CNN) ---
+    # --- Rama 1: Entrada de Imagen (CNN) ---
     image_input = layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3), name='image_input')
-
-    base_model = EfficientNetB3(
-        include_top=False,
-        weights=None,
-        input_tensor=image_input
-    )
-    # Cargando los pesos de EfficientNetB3 Noisy Student que ya están en el notebook.
+    base_model = EfficientNetB3(include_top=False, weights=None, input_tensor=image_input)
     base_model.load_weights('/kaggle/input/tf-efficientnet-noisy-student-weights/efficientnet-b3_noisy-student_notop.h5', by_name=True)
-    base_model.trainable = False # Empezar congelando el 'backbone'
+    base_model.trainable = False
+    cnn_output = layers.GlobalAveragePooling2D()(base_model.output)
+    cnn_output = layers.Dense(128, activation='relu')(cnn_output)
 
-    # Cabezal del Modelo
-    x = layers.GlobalAveragePooling2D()(base_model.output)
-    x = layers.Dense(256, activation='relu')(x)
+    # --- Rama 2: Entrada de Metadatos (MLP) ---
+    meta_input = layers.Input(shape=(N_META_FEATURES,), name='meta_input')
+    mlp_output = layers.Dense(64, activation='relu')(meta_input)
+    mlp_output = layers.Dense(32, activation='relu')(mlp_output)
+
+    # --- Fusión y Cabezal Final ---
+    concatenated = layers.Concatenate()([cnn_output, mlp_output])
+    x = layers.Dense(128, activation='relu')(concatenated)
     x = layers.Dropout(0.3)(x)
-    x = layers.Dense(128, activation='relu')(x)
-    x = layers.Dropout(0.3)(x)
-    x = layers.Dense(64, activation='relu')(x)
-    x = layers.Dropout(0.4)(x)
     output = layers.Dense(N_TARGETS, activation='linear', name='output')(x)
 
     # --- Crear el Modelo ---
-    model = keras.Model(
-        inputs=image_input,
-        outputs=output
-    )
+    model = keras.Model(inputs={'image_input': image_input, 'meta_input': meta_input}, outputs=output)
 
     return model, base_model
 
@@ -208,9 +229,13 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(df_train)):
     train_df_fold = df_train.iloc[train_idx]
     val_df_fold = df_train.iloc[val_idx]
 
+    # Extraer los meta-features para este fold
+    train_meta_fold = train_df_fold[META_FEATURES].values
+    val_meta_fold = val_df_fold[META_FEATURES].values
+
     # Crear datasets para este fold
-    train_ds = create_dataset(train_df_fold, is_train=True)
-    val_ds = create_dataset(val_df_fold, is_train=False) # No aumentar datos en validación
+    train_ds = create_dataset(train_df_fold, train_meta_fold, is_train=True)
+    val_ds = create_dataset(val_df_fold, val_meta_fold, is_train=False)
 
     # Construir y compilar un modelo nuevo para cada fold
     model, base_model = build_model()
@@ -220,27 +245,22 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(df_train)):
     for layer in base_model.layers[:-40]:
         layer.trainable = False
 
-    # Calendario de Tasa de Aprendizaje
-    lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
-        initial_learning_rate=LEARNING_RATE,
-        decay_steps=len(train_df_fold) // BATCH_SIZE * 5, # Decae cada 5 épocas
-        decay_rate=0.5)
-
     model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=lr_schedule),
+        optimizer=keras.optimizers.Adam(learning_rate=LEARNING_RATE),
         loss=weighted_mse_loss,
         metrics=[WeightedR2Score()]
     )
 
     # Callbacks
     early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+    reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.1, patience=5, verbose=1)
 
     # Entrenar el modelo
     model.fit(
         train_ds,
         epochs=EPOCHS,
         validation_data=val_ds,
-        callbacks=[early_stopping]
+        callbacks=[early_stopping, reduce_lr]
     )
 
     # Guardar los pesos del modelo entrenado
@@ -252,25 +272,36 @@ print("\n--- Entrenamiento con Cross-Validation completado. ---")
 # --- 6. PREDICCIÓN CON ENSEMBLE Y TTA ---
 
 print("Generando predicciones de sumisión con Ensemble y TTA...")
+# Cargar datos de prueba y obtener filas únicas por imagen
 df_test_long = pd.read_csv(TEST_CSV_PATH)
-df_test_unique_images = df_test_long[['image_path']].drop_duplicates()
-df_test_unique_images['image_path'] = df_test_unique_images['image_path'].apply(lambda x: os.path.join(BASE_PATH, x))
+df_test = df_test_long.drop(columns=['sample_id', 'target_name']).drop_duplicates().reset_index(drop=True)
 
-def create_test_dataset(df, augment=False):
-    """Crea un dataset de test, con opción de aumento para TTA."""
-    ds = tf.data.Dataset.from_tensor_slices(df['image_path'].values)
-    ds = ds.map(preprocess_image, num_parallel_calls=tf.data.AUTOTUNE)
+# Aplicar ingeniería de características al conjunto de prueba
+print("Aplicando ingeniería de características al conjunto de prueba...")
+df_test = feature_engineer(df_test)
+df_test[encoded_cols] = encoder.transform(df_test[categorical_features])
+df_test[numerical_features] = scaler.transform(df_test[numerical_features])
+
+# Crear rutas de imagen completas
+df_test['image_path'] = df_test['image_path'].apply(lambda x: os.path.join(BASE_PATH, x))
+
+# Extraer los meta-features para la predicción
+df_test_meta = df_test[META_FEATURES].values
+
+def create_test_dataset(df, meta_features, augment=False):
+    """Crea un dataset de test para el modelo multi-modal."""
+
+    ds_img = tf.data.Dataset.from_tensor_slices(df['image_path'].values).map(preprocess_image, num_parallel_calls=tf.data.AUTOTUNE)
 
     if augment:
-        # Para TTA, solo usaremos un aumento simple como el volteo horizontal
-        ds = ds.map(lambda img: tf.image.random_flip_left_right(img), num_parallel_calls=tf.data.AUTOTUNE)
+        ds_img = ds_img.map(lambda img: tf.image.flip_left_right(img), num_parallel_calls=tf.data.AUTOTUNE)
 
-    ds = ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+    ds_meta = tf.data.Dataset.from_tensor_slices(meta_features.astype(np.float32))
+
+    ds_inputs = tf.data.Dataset.zip(({'image_input': ds_img, 'meta_input': ds_meta}))
+
+    ds = ds_inputs.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
     return ds
-
-# Crear datasets de test (original y aumentado para TTA)
-test_ds_original = create_test_dataset(df_test_unique_images, augment=False)
-test_ds_augmented = create_test_dataset(df_test_unique_images, augment=True)
 
 # Construir un modelo solo para cargar los pesos
 inference_model, _ = build_model()
@@ -280,9 +311,12 @@ for fold in range(N_FOLDS):
     print(f"Prediciendo con modelo del Fold {fold+1}/{N_FOLDS}...")
     inference_model.load_weights(f'model_fold_{fold}.weights.h5')
 
-    # Predecir en imágenes originales
+    # Crear datasets de test para este fold
+    test_ds_original = create_test_dataset(df_test, df_test_meta, augment=False)
+    test_ds_augmented = create_test_dataset(df_test, df_test_meta, augment=True)
+
+    # Predecir en datos originales y aumentados
     preds_original = inference_model.predict(test_ds_original)
-    # Predecir en imágenes aumentadas (TTA)
     preds_augmented = inference_model.predict(test_ds_augmented)
 
     # Promediar las predicciones de TTA y añadir a la lista
@@ -294,7 +328,7 @@ final_preds = np.mean(all_preds, axis=0)
 
 # --- Generar archivo de sumisión (misma lógica que antes) ---
 df_preds_wide = pd.DataFrame(final_preds, columns=TARGET_NAMES)
-df_preds_wide['image_path'] = df_test_unique_images['image_path'].apply(lambda x: os.path.relpath(x, BASE_PATH)).values
+df_preds_wide['image_path'] = df_test['image_path'].apply(lambda x: os.path.relpath(x, BASE_PATH)).values
 
 df_preds_long = df_preds_wide.melt(
     id_vars=['image_path'],

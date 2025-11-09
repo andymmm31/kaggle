@@ -3,7 +3,7 @@ import pandas as pd
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
-from tensorflow.keras.applications import EfficientNetB3
+from tensorflow.keras.applications import EfficientNetB4
 import os
 from sklearn.model_selection import KFold
 
@@ -17,8 +17,8 @@ TRAIN_CSV_PATH = os.path.join(BASE_PATH, 'train.csv')
 TEST_CSV_PATH = os.path.join(BASE_PATH, 'test.csv')
 
 # Constantes del modelo
-IMG_SIZE = 300 # Tamaño para EfficientNetB3
-BATCH_SIZE = 16 # Reducido para B3 y imágenes más grandes
+IMG_SIZE = 380 # Tamaño para EfficientNetB4
+BATCH_SIZE = 8 # Reducido para B4 y imágenes más grandes
 LEARNING_RATE = 0.001
 EPOCHS = 50 # Aumentado para entrenamiento controlado
 TARGET_NAMES = ['Dry_Green_g', 'Dry_Dead_g', 'Dry_Clover_g', 'GDM_g', 'Dry_Total_g']
@@ -163,18 +163,20 @@ def weighted_mse_loss(y_true, y_pred):
 # --- 4. ARQUITECTURA DEL MODELO MULTIMODAL ---
 
 def build_model():
-    """Construye el modelo de solo visión (CNN) usando EfficientNetB3."""
+    """Construye el modelo de solo visión (CNN) usando EfficientNetB4."""
 
     # --- Entrada de Imagen (CNN) ---
     image_input = layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3), name='image_input')
 
-    base_model = EfficientNetB3(
+    base_model = EfficientNetB4(
         include_top=False,
         weights=None,
         input_tensor=image_input
     )
-    # Cargando los pesos de EfficientNetB3 Noisy Student que ya están en el notebook.
-    base_model.load_weights('/kaggle/input/tf-efficientnet-noisy-student-weights/efficientnet-b3_noisy-student_notop.h5', by_name=True)
+    # Cargando los pesos de EfficientNetB4 Noisy Student.
+    weights_path = '/kaggle/input/tf-efficientnet-noisy-student-weights/efficientnet-b4_noisy-student_notop.h5'
+    print(f"Cargando pesos desde: {weights_path}")
+    base_model.load_weights(weights_path, by_name=True)
     base_model.trainable = False # Empezar congelando el 'backbone'
 
     # Cabezal del Modelo
@@ -212,22 +214,40 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(df_train)):
     # Construir y compilar un modelo nuevo para cada fold
     model, base_model = build_model()
 
-    # Descongelar para fine-tuning
+    # --- FASE 1: WARM-UP DE LA CABECERA ---
+    print("Iniciando Fase 1: Warm-up de la cabecera...")
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=1e-3),
+        loss=weighted_mse_loss,
+        metrics=[WeightedR2Score()]
+    )
+    model.fit(
+        train_ds,
+        epochs=5, # Entrenar solo por 5 épocas para el warm-up
+        validation_data=val_ds,
+        verbose=1
+    )
+    print("Warm-up completado.")
+
+    # --- FASE 2: FINE-TUNING ---
+    print("Iniciando Fase 2: Fine-tuning...")
+    # Descongelar las capas superiores para el fine-tuning
     base_model.trainable = True
-    for layer in base_model.layers[:-40]:
+    for layer in base_model.layers[:-60]: # Ajustado para B4, un poco más profundo
         layer.trainable = False
 
+    # Re-compilar con una tasa de aprendizaje mucho más baja
     model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=LEARNING_RATE),
+        optimizer=keras.optimizers.Adam(learning_rate=1e-4), # Tasa de aprendizaje reducida
         loss=weighted_mse_loss,
         metrics=[WeightedR2Score()]
     )
 
-    # Callbacks
+    # Callbacks para el fine-tuning
     early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
-    reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.1, patience=5, verbose=1)
+    reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=4, verbose=1)
 
-    # Entrenar el modelo
+    # Continuar entrenando el modelo
     model.fit(
         train_ds,
         epochs=EPOCHS,

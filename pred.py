@@ -248,21 +248,32 @@ df_test_long = pd.read_csv(TEST_CSV_PATH)
 df_test_unique_images = df_test_long[['image_path']].drop_duplicates()
 df_test_unique_images['image_path'] = df_test_unique_images['image_path'].apply(lambda x: os.path.join(BASE_PATH, x))
 
-def create_test_dataset(df, augment=False):
-    """Crea un dataset de test, con opción de aumento para TTA."""
+def create_test_dataset(df, augmentation_type='none'):
+    """
+    Crea un dataset de test, con opción de aumento para TTA.
+    augmentation_type puede ser 'none', 'h_flip', 'v_flip', 'hv_flip'.
+    """
     ds = tf.data.Dataset.from_tensor_slices(df['image_path'].values)
     ds = ds.map(preprocess_image, num_parallel_calls=tf.data.AUTOTUNE)
 
-    if augment:
-        # Para TTA, solo usaremos un aumento simple como el volteo horizontal
-        ds = ds.map(lambda img: tf.image.random_flip_left_right(img), num_parallel_calls=tf.data.AUTOTUNE)
+    if augmentation_type == 'h_flip':
+        ds = ds.map(lambda img: tf.image.flip_left_right(img), num_parallel_calls=tf.data.AUTOTUNE)
+    elif augmentation_type == 'v_flip':
+        ds = ds.map(lambda img: tf.image.flip_up_down(img), num_parallel_calls=tf.data.AUTOTUNE)
+    elif augmentation_type == 'hv_flip':
+        ds = ds.map(lambda img: tf.image.flip_left_right(img), num_parallel_calls=tf.data.AUTOTUNE)
+        ds = ds.map(lambda img: tf.image.flip_up_down(img), num_parallel_calls=tf.data.AUTOTUNE)
 
     ds = ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
     return ds
 
-# Crear datasets de test (original y aumentado para TTA)
-test_ds_original = create_test_dataset(df_test_unique_images, augment=False)
-test_ds_augmented = create_test_dataset(df_test_unique_images, augment=True)
+# Crear datasets de test para 4-way TTA
+print("Creando datasets para Test-Time Augmentation (4-way)...")
+test_ds_original = create_test_dataset(df_test_unique_images, augmentation_type='none')
+test_ds_h_flip = create_test_dataset(df_test_unique_images, augmentation_type='h_flip')
+test_ds_v_flip = create_test_dataset(df_test_unique_images, augmentation_type='v_flip')
+test_ds_hv_flip = create_test_dataset(df_test_unique_images, augmentation_type='hv_flip')
+
 
 # Construir un modelo solo para cargar los pesos
 inference_model, _ = build_model()
@@ -272,17 +283,25 @@ for fold in range(N_FOLDS):
     print(f"Prediciendo con modelo del Fold {fold+1}/{N_FOLDS}...")
     inference_model.load_weights(f'model_fold_{fold}.weights.h5')
 
-    # Predecir en imágenes originales
+    # Predecir en las 4 versiones aumentadas
     preds_original = inference_model.predict(test_ds_original)
-    # Predecir en imágenes aumentadas (TTA)
-    preds_augmented = inference_model.predict(test_ds_augmented)
+    preds_h_flip = inference_model.predict(test_ds_h_flip)
+    preds_v_flip = inference_model.predict(test_ds_v_flip)
+    preds_hv_flip = inference_model.predict(test_ds_hv_flip)
 
-    # Promediar las predicciones de TTA y añadir a la lista
-    avg_preds = (preds_original + preds_augmented) / 2.0
+    # Promediar las 4 predicciones de TTA y añadir a la lista
+    avg_preds = (preds_original + preds_h_flip + preds_v_flip + preds_hv_flip) / 4.0
     all_preds.append(avg_preds)
 
 # Promediar las predicciones de todos los folds (Ensemble)
 final_preds = np.mean(all_preds, axis=0)
+
+# --- Post-procesamiento para forzar la consistencia física ---
+# Asumimos que Dry_Total_g es la suma de sus componentes.
+# Indices basados en TARGET_NAMES: 0:Dry_Green_g, 1:Dry_Dead_g, 2:Dry_Clover_g, 4:Dry_Total_g
+print("Aplicando post-procesamiento para recalcular Dry_Total_g...")
+final_preds[:, 4] = final_preds[:, 0] + final_preds[:, 1] + final_preds[:, 2]
+print("Post-procesamiento completado.")
 
 # --- Generar archivo de sumisión (misma lógica que antes) ---
 df_preds_wide = pd.DataFrame(final_preds, columns=TARGET_NAMES)

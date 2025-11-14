@@ -3,9 +3,9 @@ import pandas as pd
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
-from tensorflow.keras.applications import EfficientNetB4
+from tensorflow.keras.applications import EfficientNetB3
 import os
-from sklearn.model_selection import KFold
+from sklearn.model_selection import StratifiedGroupKFold
 
 # --- 1. CONFIGURACIÓN Y CONSTANTES ---
 
@@ -17,8 +17,8 @@ TRAIN_CSV_PATH = os.path.join(BASE_PATH, 'train.csv')
 TEST_CSV_PATH = os.path.join(BASE_PATH, 'test.csv')
 
 # Constantes del modelo
-IMG_SIZE = 380 # Tamaño para EfficientNetB4
-BATCH_SIZE = 8 # Reducido para B4 y imágenes más grandes
+IMG_SIZE = 300 # Tamaño para EfficientNetB3
+BATCH_SIZE = 16 # Reducido para B3 y imágenes más grandes
 LEARNING_RATE = 0.001
 EPOCHS = 50 # Aumentado para entrenamiento controlado
 TARGET_NAMES = ['Dry_Green_g', 'Dry_Dead_g', 'Dry_Clover_g', 'GDM_g', 'Dry_Total_g']
@@ -32,8 +32,11 @@ LOSS_WEIGHTS = tf.constant([0.1, 0.1, 0.1, 0.2, 0.5])
 # --- 2. PRE-PROCESAMIENTO DE DATOS ---
 
 def load_and_pivot_data():
-    """Carga train.csv y lo pivota a formato ancho, solo con targets."""
+    """Carga train.csv, pivota los targets y conserva metadatos para el CV."""
     df_train_long = pd.read_csv(TRAIN_CSV_PATH)
+
+    # Crear un df con metadatos únicos por imagen
+    df_metadata = df_train_long[['image_path', 'State', 'Sampling_Date']].drop_duplicates()
 
     # Pivoteamos los targets para tener una fila por imagen
     df_train_wide = df_train_long.pivot(
@@ -42,13 +45,16 @@ def load_and_pivot_data():
         values='target'
     ).reset_index()
 
-    # Quitar filas con targets faltantes
-    df_train_wide = df_train_wide.dropna()
+    # Unir los metadatos con los targets pivotados
+    df_final = pd.merge(df_metadata, df_train_wide, on='image_path')
 
-    print(f"Datos 'anchos' para entrenamiento: {df_train_wide.shape}")
-    print(df_train_wide.head())
+    # Quitar filas con targets o metadatos faltantes
+    df_final = df_final.dropna()
 
-    return df_train_wide
+    print(f"Datos finales para entrenamiento: {df_final.shape}")
+    print(df_final.head())
+
+    return df_final
 
 # Cargar los datos
 df_train = load_and_pivot_data()
@@ -163,18 +169,18 @@ def weighted_mse_loss(y_true, y_pred):
 # --- 4. ARQUITECTURA DEL MODELO MULTIMODAL ---
 
 def build_model():
-    """Construye el modelo de solo visión (CNN) usando EfficientNetB4."""
+    """Construye el modelo de solo visión (CNN) usando EfficientNetB3."""
 
     # --- Entrada de Imagen (CNN) ---
     image_input = layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3), name='image_input')
 
-    base_model = EfficientNetB4(
+    base_model = EfficientNetB3(
         include_top=False,
         weights=None,
         input_tensor=image_input
     )
-    # Cargando los pesos de EfficientNetB4 Noisy Student.
-    weights_path = '/kaggle/input/tf-efficientnet-noisy-student-weights/efficientnet-b4_noisy-student_notop.h5'
+    # Cargando los pesos de EfficientNetB3 Noisy Student.
+    weights_path = '/kaggle/input/tf-efficientnet-noisy-student-weights/efficientnet-b3_noisy-student_notop.h5'
     print(f"Cargando pesos desde: {weights_path}")
     base_model.load_weights(weights_path, by_name=True)
     base_model.trainable = False # Empezar congelando el 'backbone'
@@ -198,9 +204,17 @@ def build_model():
 
 # --- 5. ENTRENAMIENTO CON CROSS-VALIDATION ---
 N_FOLDS = 5
-kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=42)
+# Usamos StratifiedGroupKFold para replicar mejor la estructura de los datos de test
+sgkf = StratifiedGroupKFold(n_splits=N_FOLDS, shuffle=True, random_state=42)
 
-for fold, (train_idx, val_idx) in enumerate(kf.split(df_train)):
+# X son las características (en este caso, solo las rutas de imagen), y no se usan directamente en el split
+# y es la variable de estratificación (State)
+# groups es la variable de agrupación (Sampling_Date)
+X = df_train['image_path']
+y = df_train['State']
+groups = df_train['Sampling_Date']
+
+for fold, (train_idx, val_idx) in enumerate(sgkf.split(X, y, groups)):
     print(f"\n--- Iniciando Entrenamiento para Fold {fold+1}/{N_FOLDS} ---")
 
     # Crear dataframes para este fold
@@ -233,7 +247,7 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(df_train)):
     print("Iniciando Fase 2: Fine-tuning...")
     # Descongelar las capas superiores para el fine-tuning
     base_model.trainable = True
-    for layer in base_model.layers[:-60]: # Ajustado para B4, un poco más profundo
+    for layer in base_model.layers[:-40]: # Valor original para B3
         layer.trainable = False
 
     # Re-compilar con una tasa de aprendizaje mucho más baja
